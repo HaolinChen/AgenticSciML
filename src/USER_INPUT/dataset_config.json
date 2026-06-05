@@ -1,0 +1,12 @@
+{
+  "training_set": {
+    "filename": "train_data.npz",
+    "description": "Training points for regression. Shapes: x_train (200, 1), u_train (200, 1).",
+    "loading_instructions": "Use np.load('train_data.npz'). Access via data['x_train'] and data['u_train']"
+  },
+  "validation_set": {
+    "filename": "val_data.npz",
+    "description": "Validation points for evaluation. Shapes: x_val (500, 1), u_val (500, 1).",
+    "loading_instructions": "Use np.load('val_data.npz'). Access via data['x_val'] and data['u_val']"
+  }
+}

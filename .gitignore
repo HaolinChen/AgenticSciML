@@ -1,0 +1,27 @@
+# --- Secrets ---
+.env
+*.env
+.env.*
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ipynb_checkpoints/
+venv/
+.venv/
+env/
+
+# --- Run artifacts / outputs ---
+TESTING/
+SOLUTION_AND_OUTPUTS/
+SELECTION_LOGS/
+telemetry_logs/
+*.log
+
+# --- OS / editor ---
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
