@@ -1,0 +1,17 @@
+# AgenticSciML dependencies
+# Install with:  pip install -r requirements.txt
+
+# --- Calling the agents (LLM orchestration) ---
+python-dotenv
+pydantic
+langgraph
+langchain-core
+langchain-anthropic
+langchain-openai
+langchain-google-genai
+
+# --- Running the code the agents generate (SciML stack) ---
+torch
+numpy
+scipy
+matplotlib
