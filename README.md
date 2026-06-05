@@ -16,7 +16,7 @@
 [![PyTorch](https://img.shields.io/badge/PyTorch-EE4C2C?style=flat-square&logo=pytorch&logoColor=white)](https://pytorch.org/)
 [![LangChain](https://img.shields.io/badge/LangChain-1C3C3C?style=flat-square&logo=langchain&logoColor=white)](https://www.langchain.com/)
 [![Multi-Agent](https://img.shields.io/badge/Multi--Agent-Debate_+_Tree_Search-6f42c1?style=flat-square)](#-how-it-works)
-[![Stars](https://img.shields.io/github/stars/Qile-J/AgenticSciML?style=flat-square&logo=github)](https://github.com/Qile-J/AgenticSciML/stargazers)
+[![Star on GitHub](https://img.shields.io/badge/⭐_Star_on_GitHub-f0b400?style=flat-square&logo=github&logoColor=white)](https://github.com/Qile-J/AgenticSciML)
 
 **Qile Jiang · George Em Karniadakis**
 
