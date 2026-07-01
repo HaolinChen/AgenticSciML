@@ -9,6 +9,56 @@ This script generates the initial solution (solution_0) and performs validation:
 5. Execute with --mode=train (full training)
 6. Analyst generates performance analysis
 7. Store results and analysis
+
+============================================================================
+中文模块说明（学习注释）
+============================================================================
+作用：
+    Phase2「根解生成」。生成初始解 solution_0 并跑通它：
+      engineer 生成 solution.py -> validate(1 个 epoch 冒烟) -> 若失败由 validator
+      判定责任方(tester_error/engineer_error)并循环修正 -> 通过后 train 全量训练 ->
+      analyst 分析 -> 把结果写入 RESULTS/results.json（键 solution_0）。
+    这是进化树的“根”，后续所有子代都基于它变异。
+
+在 pipeline 中的位置：
+    在 Phase1(create_contract.py) 之后运行；依赖已生成的 TESTING 合约。
+    产出的 solution_0 与 results.json 是 Phase3 进化循环的起点。
+
+主要输入：
+    - 文件：USER_INPUT/problem.md、requirements.md、evaluation.md（必需）
+            TESTING/guidelines.md、TESTING/evaluate.py（必需，来自 Phase1）
+            USER_INPUT/dataset_config.json（可选，读取训练集信息）
+    - 环境变量：constants.py 的 SCIML_* 配置（目录、模型/温度、MAX_DEBUG_ITERATIONS
+      验证/调试上限、TIMEOUT_* 执行超时）；LLM API Key（.env）
+
+主要输出：
+    - 目录/文件：SOLUTION_AND_OUTPUTS/solution_0/{solution.py, evaluate.py, 数据集,
+      train_log.txt, test_log.txt, MODEL_CHECKPOINT 等}
+    - RESULTS/results.json 中的 solution_0 条目（score/status/是否通过/迭代次数）
+    - TESTING/debugging_history.log（validator 决策历史）
+    - 返回：main() 返回 0/1
+
+关键辅助函数：
+    create_solution_directory / save_solution_file / copy_evaluate_to_solution_dir /
+    copy_datasets_to_solution_dir（准备解目录），log_validator_decision（记录判责历史）
+
+LangGraph 状态图（RootState）节点与条件边（工作流走向）：
+    入口 engineer(生成解) -> validate(建目录+冒烟验证+评测)
+    validate 处条件边 check_validation_result：
+      - "passed"        -> train（进入全量训练）
+      - "failed"        -> validator（判定责任方）
+      - "max_iterations"-> save（达 MAX_DEBUG_ITERATIONS 上限，直接落盘）
+    validator 处条件边 route_by_culprit：
+      - "tester_error"  -> tester_refine（改合约）-> engineer（重生成解）
+      - "engineer_error"-> engineer（直接重生成解）
+    train 处条件边 check_training_result：
+      - "passed"        -> save
+      - "failed"        -> engineer（带错误回工程师，训练调试循环）
+      - "max_iterations"-> save
+    save -> analyze -> END
+    说明：request_training_approval/check_training_approval 已定义但未接入图中，
+         即验证通过后“自动进入训练”，不经人审。
+============================================================================
 """
 
 from dotenv import load_dotenv
@@ -40,7 +90,14 @@ load_dotenv()
 # ============================================================================
 
 class RootState(TypedDict):
-    """State for root solution workflow"""
+    """State for root solution workflow
+
+    中文：根解工作流的共享状态。含用户输入(problem/requirements/evaluation/训练集信息)、
+        合约文件(guidelines_md/evaluate_py)、当前解代码与目录、验证/训练的输出与是否通过、
+        错误处理(error_traceback/culprit/validator_feedback)、迭代计数
+        (validation_iteration/debug_iteration)、最终 score/analysis，以及未实际接线的
+        human_approved（验证后自动训练，不经审批门）。
+    """
     # User inputs
     problem: str
     requirements: str
@@ -83,14 +140,21 @@ class RootState(TypedDict):
 # ============================================================================
 
 def create_solution_directory(solution_id: int = 0) -> str:
-    """Create solution directory and return path"""
+    """Create solution directory and return path
+
+    中文：在 SOLUTION_AND_OUTPUTS 下创建 solution_{id} 目录（默认 0=根解）并返回路径。
+        副作用：mkdir。
+    """
     solution_dir = os.path.join(SOLUTION_AND_OUTPUTS_DIR, f"solution_{solution_id}")
     os.makedirs(solution_dir, exist_ok=True)
     return solution_dir
 
 
 def save_solution_file(solution_dir: str, solution_code: str):
-    """Save solution.py to solution directory"""
+    """Save solution.py to solution directory
+
+    中文：把 engineer 生成的代码写为 solution_dir/solution.py。副作用：写文件。
+    """
     solution_path = os.path.join(solution_dir, "solution.py")
     with open(solution_path, 'w') as f:
         f.write(solution_code)
@@ -98,7 +162,11 @@ def save_solution_file(solution_dir: str, solution_code: str):
 
 
 def copy_evaluate_to_solution_dir(solution_dir: str):
-    """Copy evaluate.py to solution directory"""
+    """Copy evaluate.py to solution directory
+
+    中文：把合约里的 TESTING/evaluate.py 复制到解目录，使该解可独立执行评测。
+        副作用：拷贝文件。
+    """
     src = os.path.join(TESTING_DIR, "evaluate.py")
     dst = os.path.join(solution_dir, "evaluate.py")
     shutil.copy(src, dst)
@@ -106,7 +174,11 @@ def copy_evaluate_to_solution_dir(solution_dir: str):
 
 
 def copy_datasets_to_solution_dir(solution_dir: str):
-    """Copy dataset files to solution directory (like evaluate.py)"""
+    """Copy dataset files to solution directory (like evaluate.py)
+
+    中文：依据 dataset_config.json 把训练集/验证集数据文件及配置本身复制进解目录，
+        使解目录成为自包含的执行环境。无配置则直接返回。副作用：拷贝文件；异常仅告警。
+    """
     if not os.path.exists(DATASET_CONFIG_PATH):
         return
 
@@ -147,6 +219,9 @@ def log_validator_decision(iteration: int, culprit: str, feedback: str, error_tr
         culprit: Who is at fault ("tester_error" or "engineer_error")
         feedback: Specific feedback from validator
         error_traceback: The error that triggered validation
+
+    中文：把 validator 的判责结果与错误 traceback 追加写入
+        TESTING/debugging_history.log，形成可追溯的调试历史。副作用：追加写文件。
     """
     log_path = os.path.join(TESTING_DIR, "debugging_history.log")
 
@@ -184,6 +259,10 @@ ERROR TRACEBACK:
 def engineer_agent(state: RootState) -> RootState:
     """
     Engineer agent generates solution code
+
+    中文（图节点）：调用共享 engineer 智能体，依据 problem/requirements/guidelines/
+        训练集信息生成 solution.py；若带有 validator_feedback 则据此在现有代码上修订。
+        副作用：调用 LLM。返回：solution_code，并把 debug_iteration 加 1。
     """
 
     print("\n" + "="*80)
@@ -214,6 +293,15 @@ def engineer_agent(state: RootState) -> RootState:
 def prepare_and_validate(state: RootState) -> RootState:
     """
     Prepare solution directory and run validation
+
+    中文（图节点）：准备解目录并做“冒烟验证”。
+        步骤：建 solution_0 目录 -> 写 solution.py -> 拷入 evaluate.py 与数据集 ->
+              execute_solution(mode="validate")（1 epoch，写 train_log.txt）->
+              若通过再 execute_evaluation() 打分（写 test_log.txt）。
+        副作用：写文件、起子进程执行训练/评测脚本。
+        返回：validation_passed 及日志/分数/error_traceback，validation_iteration+1。
+        三种情况：验证+评测均过（passed）、验证过但评测失败、验证本身失败
+                （后两者 passed=False，error_traceback 记录对应日志）。
     """
 
     print("\n" + "="*80)
@@ -297,6 +385,12 @@ def prepare_and_validate(state: RootState) -> RootState:
 def validator_agent(state: RootState) -> RootState:
     """
     Validator agent determines culprit and provides feedback
+
+    中文（图节点）：验证失败时，让 validator 智能体分析错误，判定责任方
+        （culprit = tester_error 表示合约/评测有问题；engineer_error 表示解代码有问题），
+        并给出具体修订建议。
+        副作用：调用 LLM；把判责结果写入 debugging_history.log。
+        返回：culprit 与 validator_feedback（供 route_by_culprit 路由使用）。
     """
 
     print("\n" + "="*80)
@@ -333,6 +427,12 @@ def validator_agent(state: RootState) -> RootState:
 def tester_refine(state: RootState) -> RootState:
     """
     Tester refines contract based on validator feedback
+
+    中文（图节点）：当判责为 tester_error 时，让 tester 依据 validator_feedback
+        重新生成合约，并覆盖写回 TESTING/evaluate.py 与 guidelines.md。
+        副作用：调用 LLM、覆盖写两份合约文件。
+        返回：更新后的 guidelines_md/evaluate_py，并清空 validator_feedback
+             （之后回到 engineer 用新合约重生成解）。
     """
     print("\n" + "="*80)
     print("TESTER REFINEMENT")
@@ -365,6 +465,11 @@ def tester_refine(state: RootState) -> RootState:
 def request_training_approval(state: RootState) -> RootState:
     """
     Request human approval before expensive training
+
+    中文（图节点，当前未接入图中）：在昂贵的全量训练前请求人工确认。
+        交互式读取输入，APPROVE 则 human_approved=True，否则 False。
+        注意：create_root_graph 未把该节点接线，验证通过后会“自动进入训练”，
+             因此此函数目前不会被执行；保留以便需要人审时启用。
     """
     print("\n" + "="*80)
     print("VALIDATION PASSED - TRAINING APPROVAL")
@@ -389,6 +494,13 @@ def request_training_approval(state: RootState) -> RootState:
 def execute_training(state: RootState) -> RootState:
     """
     Execute full training with --mode=train
+
+    中文（图节点）：对已通过验证的解跑全量训练。
+        execute_solution(mode="train")（覆盖写 train_log.txt）-> 成功再 execute_evaluation
+        对训练后模型打分（写 test_log.txt）。
+        副作用：起子进程做完整训练/评测（耗时，受 TIMEOUT_TRAINING 约束）、写日志。
+        返回：training_passed 与 score/日志；失败时记录 error_traceback
+             （交由 check_training_result 决定是否回 engineer 调试）。
     """
 
     print("\n" + "="*80)
@@ -454,6 +566,11 @@ def save_results(state: RootState) -> RootState:
     """
     Save results to disk
     Note: Analysis is run automatically in the next node
+
+    中文（图节点）：把根解结果写入 RESULTS/results.json 的 solution_0 条目
+        （parent_id=None、score、status、验证/训练是否通过、验证迭代次数）。
+        副作用：创建 RESULTS_DIR、写 results.json。返回：原样 state。
+        紧接的 analyze 节点会自动生成分析。
     """
 
     print("\n" + "="*80)
@@ -488,6 +605,10 @@ def save_results(state: RootState) -> RootState:
 def analyze_root(state: RootState) -> RootState:
     """
     Generate analysis for root solution
+
+    中文（图节点）：调用 analyze.analyze_solution 为 solution_0 生成性能分析
+        （根解无 proposal、无 parent）。副作用：调用 LLM/分析流程、可能写分析文件。
+        失败不阻断工作流，仅把错误信息写入 analysis 字段。返回：analysis。
     """
 
     print("\n" + "="*80)
@@ -524,7 +645,13 @@ def analyze_root(state: RootState) -> RootState:
 # ============================================================================
 
 def check_validation_result(state: RootState) -> Literal["passed", "failed", "max_iterations"]:
-    """Decide next step after validation"""
+    """Decide next step after validation
+
+    中文（条件边路由，validate 之后）：
+        - 通过                                    -> "passed"（去 train）
+        - 未过且 validation_iteration>=上限        -> "max_iterations"（去 save 收尾）
+        - 未过且未达上限                           -> "failed"（去 validator 判责）
+    """
     if state['validation_passed']:
         return "passed"
     elif state.get('validation_iteration', 0) >= MAX_DEBUG_ITERATIONS:
@@ -535,12 +662,20 @@ def check_validation_result(state: RootState) -> Literal["passed", "failed", "ma
 
 
 def route_by_culprit(state: RootState) -> Literal["tester_error", "engineer_error"]:
-    """Route to appropriate refinement based on culprit"""
+    """Route to appropriate refinement based on culprit
+
+    中文（条件边路由，validator 之后）：按 validator 判定的责任方分流——
+        "tester_error" -> 去 tester_refine 改合约；"engineer_error" -> 回 engineer 改代码。
+    """
     return state['culprit']
 
 
 def check_training_approval(state: RootState) -> Literal["approved", "skipped"]:
-    """Check if user approved training"""
+    """Check if user approved training
+
+    中文（条件边路由，当前未接入图中）：读取 human_approved 决定 approved/skipped。
+        由于审批节点未接线，此路由目前不参与实际工作流。
+    """
     if state.get('human_approved', False):
         return "approved"
     else:
@@ -548,7 +683,13 @@ def check_training_approval(state: RootState) -> Literal["approved", "skipped"]:
 
 
 def check_training_result(state: RootState) -> Literal["passed", "failed", "max_iterations"]:
-    """Decide next step after training"""
+    """Decide next step after training
+
+    中文（条件边路由，train 之后）：
+        - 训练通过                              -> "passed"（去 save）
+        - 未过且 debug_iteration>=上限           -> "max_iterations"（去 save 收尾）
+        - 未过且未达上限                         -> "failed"（回 engineer 带错误调试重生成）
+    """
     if state.get('training_passed', False):
         return "passed"
     elif state.get('debug_iteration', 0) >= MAX_DEBUG_ITERATIONS:
@@ -565,6 +706,13 @@ def check_training_result(state: RootState) -> Literal["passed", "failed", "max_
 def create_root_graph():
     """
     Build the LangGraph workflow for root solution initialization
+
+    中文：装配并编译根解状态图。
+        入口 engineer -> validate；validate 经 check_validation_result 分派
+        train/validator/save；validator 经 route_by_culprit 分派
+        tester_refine/engineer；tester_refine -> engineer；
+        train 经 check_training_result 分派 save/engineer/save；save -> analyze -> END。
+        注意 approval 相关节点未接线（验证通过自动训练）。返回：已编译的图。
     """
     workflow = StateGraph(RootState)
 
@@ -631,6 +779,10 @@ def create_root_graph():
 def main():
     """
     Main entry point for root solution initialization
+
+    中文（入口）：读取 USER_INPUT 三份 md 与 TESTING 合约两文件（缺失则报错退出），
+        加载训练集信息，初始化 debugging_history.log，构造初始 state 并 invoke 状态图。
+        副作用：读/写文件、间接触发 LLM 与子进程训练/评测。返回：0 成功 / 1 异常或中止。
     """
 
     print("\n" + "="*80)

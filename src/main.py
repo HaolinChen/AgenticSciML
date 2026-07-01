@@ -5,6 +5,56 @@ This script coordinates the full workflow:
 - Phase 1: Contract creation
 - Phase 2: Root solution generation
 - Phase 3: Evolutionary optimization loop
+
+============================================================================
+中文模块说明（学习注释）
+============================================================================
+作用：
+    本文件是整个 AgenticSciML 多智能体系统的“总编排器”（entry point）。
+    它按阶段串联起数据分析、合约生成、根解生成、进化循环四个阶段，
+    通过命令行参数控制运行模式与 GPU 分配，并负责阶段间的并行调度与
+    异常兜底（某一阶段失败时优雅停止而不是崩溃整个流程）。
+
+在 pipeline 中的位置：
+    最顶层调度者。它本身不实现具体的 LLM/训练逻辑，而是调用/子进程拉起
+    其它模块：
+      - Phase 0.5 数据分析：run_data_analysis.py -> data_analyst.py
+      - Phase 1 合约生成：create_contract.py（tester 智能体）
+      - Phase 2 根解生成：create_root.py -> engineer_execute_evaluate.py
+      - Phase 3 进化循环：select_mutations.py（选亲本）、propose_critic.py
+        （多智能体辩论产生提案）、engineer_execute_evaluate.py（工程化子代）、
+        analyze.py（分析子代结果）
+
+主要输入：
+    - 命令行参数：
+        --mode {full, contract-only, root-only, evolve-only}  控制执行哪些阶段
+        --gpu_ids [int ...]  可用 GPU 列表；给出但无值表示强制 CPU；不给则自动探测
+    - 文件：src/USER_INPUT/ 下的用户输入（problem/requirements/evaluation、
+      dataset_config.json、train/val .npz）；src/RESULTS/results.json（历史解及分数）
+    - 环境变量：SCIML_TELEMETRY_DIR / SCIML_TELEMETRY_ITERATION /
+      SCIML_TELEMETRY_SOLUTION_ID（遥测），CUDA_VISIBLE_DEVICES（GPU 绑定）
+
+主要输出：
+    - 通过子进程与子模块产生的产物写入 src/RESULTS/、src/SOLUTION_AND_OUTPUTS/、
+      src/PROPOSAL_POOL/ 等目录
+    - 进化循环结束后合并遥测并写出 RESULTS/telemetry_summary.json
+    - 进程退出码：正常 0；被中断或致命错误 1
+
+关键函数列表：
+    - load_results_json()             读取 results.json
+    - run_data_analysis_phase()       Phase 0.5 数据分析阶段封装
+    - run_contract_creation()         Phase 1 合约生成阶段封装
+    - run_root_solution()             Phase 2 根解生成阶段封装（子进程）
+    - get_top_k_solutions()           按分数取 Top-K 解
+    - get_child_count()               统计某亲本已有的子代数量
+    - select_parents_for_mutation()   选取本轮用于变异的亲本（早期/成熟两种策略）
+    - generate_proposals_batch()      并行生成子代提案
+    - engineer_children_batch()       并行工程化子代（多进程 + GPU 轮询分配）
+    - analyze_children_batch()        并行分析子代结果
+    - engineer_child_wrapper()        单个子代工程化的子进程包装（供多进程调用）
+    - run_evolutionary_loop()         Phase 3 进化主循环
+    - main()                          命令行入口，解析参数并按 mode 调度各阶段
+============================================================================
 """
 
 import argparse
@@ -28,7 +78,11 @@ from retrieve_KB import load_problem_description
 
 
 def load_results_json():
-    """Load results.json file"""
+    """Load results.json file
+
+    中文：读取 RESULTS/results.json（所有已生成解的元数据与分数）。
+    返回：解析后的 dict；文件不存在时返回空 dict（不报错）。
+    """
     if os.path.exists(RESULTS_FILE):
         with open(RESULTS_FILE, 'r') as f:
             return json.load(f)
@@ -40,6 +94,13 @@ def run_data_analysis_phase():
     Phase 0.5: Run data analysis on training dataset (if provided)
 
     This phase runs BEFORE contract creation to analyze training data characteristics.
+
+    中文：Phase 0.5 数据分析阶段封装。
+    做什么：若存在 dataset_config.json 且其中配置了 training_set，
+        且训练文件真实存在，则调用 run_data_analysis.main() 生成数据分析报告。
+    副作用：向标准输出打印进度；缺少配置/训练集时直接跳过（不视为错误）；
+        JSON 非法或训练文件缺失时抛出异常终止流程。
+    返回：无（None）。分析子流程失败仅打印警告并继续（非致命）。
     """
     print("\n" + "="*80)
     print("PHASE 0.5: DATA ANALYSIS")
@@ -93,6 +154,11 @@ def run_contract_creation(auto_approve=False):
 
     Args:
         auto_approve: If True, automatically approve contract without human review
+
+    中文：Phase 1 合约生成阶段封装。调用 create_contract.main() 由 tester 智能体
+        生成测试合约（evaluate.py + guidelines.md）。
+    关键参数 auto_approve：True 时跳过人工审核（用于 full 模式的非交互批处理）。
+    副作用：失败时抛 RuntimeError 终止流程。返回：无。
     """
     print("\n" + "="*80)
     print("PHASE 1: CONTRACT CREATION")
@@ -110,6 +176,11 @@ def run_contract_creation(auto_approve=False):
 def run_root_solution():
     """
     Phase 2: Run root solution generation
+
+    中文：Phase 2 根解生成阶段封装。以子进程方式运行 create_root.py，
+        由其合成/校验/训练第一个解 solution_0。
+    副作用：使用当前解释器在 src/ 目录下运行子进程；子进程返回非 0 时抛 RuntimeError。
+    返回：无。
     """
     print("\n" + "="*80)
     print("PHASE 2: ROOT SOLUTION GENERATION")
@@ -140,6 +211,11 @@ def get_top_k_solutions(k: int) -> dict:
 
     Returns:
         Dictionary mapping solution_id to result data for top-K solutions
+
+    中文：从 results.json 中按分数升序（分数越低越好）取前 K 个解。
+    关键逻辑：若成功解（status=success）数量 >= K，则只在成功解中排序；
+        否则回退到对全部解排序，保证仍能凑够候选。
+    返回：{solution_id: 结果数据} 的 dict，最多 K 项。
     """
     if not os.path.exists(RESULTS_FILE):
         return {}
@@ -181,6 +257,10 @@ def get_child_count(parent_id: str) -> int:
 
     Returns:
         Number of existing children (0-9)
+
+    中文：统计 results.json 中 parent_id 字段等于给定亲本的解数量，
+        即该亲本已产生的子代个数。用于配合 MAX_CHILDREN_PER_NODE 限制
+        与生成子代 ID。返回：整数计数（文件不存在时返回 0）。
     """
     if not os.path.exists(RESULTS_FILE):
         return 0
@@ -207,6 +287,14 @@ def select_parents_for_mutation(iteration: int) -> list[dict]:
 
     Returns:
         List of parent selections with 'solution_id' and 'selector_reasoning'
+
+    中文：为本轮进化选取用于变异的亲本，分两种策略：
+      - 早期阶段（成功且仍有配额的解数 <= MUTATION_BATCH）：全部成功解都参与变异。
+      - 成熟阶段：始终包含“当前最优且仍有子代配额”的解；其余名额由智能体集成
+        （select_solutions_for_mutation）投票产生。关键细节：先取 Top-(K+1)，
+        再剔除最优解，使集成看到的是第 2..K+1 名，避免重复选到最优解。
+    副作用：读取 results.json；打印大量进度；可能触发一次 LLM 集成调用。
+    返回：形如 [{'solution_id', 'selector_reasoning'}] 的列表；无可用亲本时返回 []。
     """
     print("\n" + "="*80)
     print("PARENT SELECTION")
@@ -332,6 +420,13 @@ def generate_proposals_batch(parent_selections: list[dict], iteration: int) -> l
 
     Returns:
         List of (child_id, parent_id) tuples
+
+    中文：为所有被选中的亲本并行生成子代提案（多智能体“提出-批判”辩论）。
+    关键逻辑：子代 ID = solution_{亲本数字}{该亲本已有子代序号}，通过线程池
+        （最多 MUTATION_BATCH 个）并发调用 generate_proposal；单个提案失败被捕获
+        并跳过（返回 None，不影响其它提案）。
+    副作用：调用 propose_critic.generate_proposal，写出提案文件。
+    返回：成功生成的 (child_id, parent_id) 元组列表。
     """
     print("\n" + "="*80)
     print("PROPOSAL GENERATION (PARALLEL)")
@@ -339,7 +434,11 @@ def generate_proposals_batch(parent_selections: list[dict], iteration: int) -> l
     print(f"Generating {len(parent_selections)} proposals...")
 
     def generate_single_proposal(parent_data: dict) -> tuple:
-        """Wrapper for parallel proposal generation"""
+        """Wrapper for parallel proposal generation
+
+        中文：单个亲本的提案生成包装（供线程池调用）。计算子代 ID，
+        调用 generate_proposal；成功返回 (child_id, parent_id)，异常返回 None。
+        """
         parent_id = parent_data['solution_id']
         selector_reasoning = parent_data['selector_reasoning']
 
@@ -387,6 +486,13 @@ def engineer_children_batch(child_parent_pairs: list[tuple], gpu_ids: list[int])
 
     Returns:
         Dictionary mapping child_id to result dict
+
+    中文：并行工程化（合成/执行/评估）所有子代。
+    关键逻辑：以轮询（round-robin）方式把子代分配到各 GPU（gpu_ids 为空则用 CPU），
+        用进程池 ProcessPoolExecutor 并发执行 engineer_child_wrapper；因为要为每个
+        子进程单独设置 CUDA_VISIBLE_DEVICES，所以用多进程而非多线程。单个子代异常
+        被捕获并记为 status='error'，不影响其它子代。
+    返回：{child_id: 结果 dict} 的字典。
     """
     print("\n" + "="*80)
     print("ENGINEERING CHILDREN (PARALLEL)")
@@ -437,6 +543,11 @@ def analyze_children_batch(child_parent_pairs: list[tuple]):
 
     Args:
         child_parent_pairs: List of (child_id, parent_id) tuples
+
+    中文：并行分析所有子代的运行结果。为每个子代以子进程运行 analyze.py，
+        传入 solution_id / parent_id / 对应的提案文件路径，并通过环境变量
+        SCIML_TELEMETRY_SOLUTION_ID 关联遥测。用线程池并发（真正的重活在子进程里）。
+    副作用：写出分析记忆等产物；打印成功计数。返回：无。
     """
     print("\n" + "="*80)
     print("ANALYZING CHILDREN (PARALLEL)")
@@ -444,7 +555,11 @@ def analyze_children_batch(child_parent_pairs: list[tuple]):
     print(f"Analyzing {len(child_parent_pairs)} children...")
 
     def analyze_single_child(child_id: str, parent_id: str):
-        """Wrapper for parallel analysis"""
+        """Wrapper for parallel analysis
+
+        中文：单个子代的分析包装（供线程池调用）。以子进程运行 analyze.py，
+        成功返回 True，失败/异常返回 False。
+        """
         try:
             print(f"\n[{child_id}] Analyzing...")
 
@@ -502,6 +617,12 @@ def engineer_child_wrapper(solution_id: str, gpu_id: int | None = None) -> dict:
 
     Returns:
         Dictionary with results from engineer_execute_evaluate
+
+    中文：单个子代工程化的“子进程包装”，被 engineer_children_batch 的进程池调用。
+    关键逻辑：复制环境变量并设置 CUDA_VISIBLE_DEVICES（None 时置空字符串 => CPU），
+        再通过 SCIML_TELEMETRY_SOLUTION_ID 传递遥测标识，最后以子进程运行
+        engineer_execute_evaluate.py。子进程返回非 0 时返回 status='error'，否则
+        返回 status='success'。返回：包含 solution_id 与 status 的 dict。
     """
     import os
     import subprocess
@@ -554,6 +675,15 @@ def run_evolutionary_loop(gpu_ids: list[int]):
 
     Args:
         gpu_ids: List of available GPU IDs (auto-detected or user-provided)
+
+    中文：Phase 3 进化主循环，最多迭代 MAX_EVOLUTIONARY_ITERATIONS 轮。
+    每轮流程：选亲本 -> 并行生成提案 -> 并行工程化子代 -> 并行分析子代。
+    关键逻辑/副作用：
+      - 通过环境变量 SCIML_TELEMETRY_DIR / SCIML_TELEMETRY_ITERATION 让子进程继承遥测上下文。
+      - 任一关键步骤（选亲本/提案/工程化）失败或产出为空则打印栈并 break 提前结束循环；
+        分析步骤失败仅告警继续（非关键）。
+      - 循环结束后统计总耗时并调用 merge_telemetry 写出 telemetry_summary.json。
+    返回：无。
     """
     import time as _time
     print("\n" + "="*80)
@@ -668,7 +798,14 @@ def run_evolutionary_loop(gpu_ids: list[int]):
 
 
 def main():
-    """Main entry point"""
+    """Main entry point
+
+    中文：命令行入口。解析 --mode 与 --gpu_ids：
+      - gpu_ids 未提供 => 自动探测 GPU；提供但为空 => 强制 CPU；提供具体值 => 使用指定 GPU。
+      - 按 mode 决定执行哪些阶段（full 会依次跑 0.5/1/2/3，且 Phase 1 自动审批）。
+    副作用：捕获 KeyboardInterrupt 与任意异常，分别以退出码 1 优雅退出/报错退出。
+    返回：无。
+    """
     parser = argparse.ArgumentParser(
         description="SciML Agent Evolutionary System Orchestrator"
     )
