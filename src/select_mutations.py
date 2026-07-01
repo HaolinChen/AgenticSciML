@@ -3,6 +3,45 @@ Selection agent for ensemble-guided batch mutation.
 
 Uses Triple-G ensemble (GPT, Grok, Gemini) to vote on which solutions
 have the most potential for further mutation.
+
+================================================================================
+中文模块说明（学习注释）
+================================================================================
+作用：
+    本模块是 AgenticSciML **Phase3 进化循环** 的“集成选择器(selector)”。
+    在每次迭代中，用多个大模型组成的集成(ENSEMBLE_MODELS，如 gpt/grok/gemini)
+    对 Top-K 候选解各自“投票”挑出最有变异潜力的解，再通过多数投票聚合出本轮
+    要变异的亲本集合，并附带选择理由。强调“开发(exploitation) vs 探索(exploration)”平衡。
+
+所属阶段：
+    Phase3（进化循环）：**选亲本(本模块)** → 多智能体辩论提案(propose_critic)
+    → 工程化子代 → 分析(analyze)。
+
+主要输入：
+    - 参数：problem（问题描述）、requirements（需求）、top_k_results（Top-K 解结果字典，
+        含 score/parent_id/status 等）、iteration（当前迭代号）。
+    - 文件：
+        * {SOLUTION_AND_OUTPUTS_DIR}/{sol_id}/solution.py —— 各候选解源码（完整）
+        * {AB_DIR}/{sol_id}_analysis.md                   —— 各候选解分析报告（完整）
+    - 环境变量：各家模型 API Key（如 grok 用 XAI_API_KEY；gpt/gemini/claude 依赖各自默认 Key）。
+    - 配置常量：MUTATION_BATCH（本轮变异总数，选择数=其减 1）、SELECTION_POOL_SIZE、
+        ENSEMBLE_MODELS、MODELS、SELECTION_LOGS_DIR。
+
+主要输出：
+    - 文件：{SELECTION_LOGS_DIR}/iteration_XXX.md —— 本轮选择日志（候选、各模型投票、
+        投票统计、最终选择与聚合理由）。
+    - 返回：select_solutions_for_mutation 返回 dict：
+        {"selected": 最终选择列表, "voting_results": 各模型原始输出, "log_file": 日志路径}。
+
+关键函数清单：
+    - SolutionSelection / SelectionOutput：selector 的 pydantic 结构化输出 schema。
+    - get_selector_llm：按模型名路由到对应 LLM 客户端。
+    - format_solution_context / generate_selector_prompt：拼接单解上下文与完整选择 prompt。
+    - run_single_selector：单个模型的一次选择（供并行调用）。
+    - aggregate_selections：多模型投票聚合（多数票，分数低者优先破平）。
+    - select_solutions_for_mutation：主入口，并行跑集成、聚合、落日志。
+    - save_selection_log：把选择过程写成 markdown 日志。
+================================================================================
 """
 
 import os
@@ -28,13 +67,20 @@ from constants import (
 # ============================================================================
 
 class SolutionSelection(BaseModel):
-    """Single solution selection with reasoning"""
+    """Single solution selection with reasoning
+
+    中文：单个被选中解的结构化条目，含解 ID 与 2-3 条选择理由。
+    """
     solution_id: str = Field(description="Solution ID (e.g., 'solution_012')")
     reasoning: str = Field(description="2-3 bullet points explaining why this solution has potential")
 
 
 class SelectionOutput(BaseModel):
-    """Structured output from selector agent"""
+    """Structured output from selector agent
+
+    中文：单个 selector 模型一次调用的结构化输出，即一组 SolutionSelection。
+    LLM 通过 with_structured_output 强制按此 schema 返回。
+    """
     selections: List[SolutionSelection] = Field(
         description="Selected solutions for mutation (count based on current MUTATION_BATCH setting)"
     )
@@ -45,7 +91,12 @@ class SelectionOutput(BaseModel):
 # ============================================================================
 
 def get_selector_llm(model_name: str):
-    """Get LLM instance for selector agent"""
+    """Get LLM instance for selector agent
+
+    中文：根据模型名字符串路由到对应的 LangChain LLM 客户端
+    （claude→Anthropic，gpt→OpenAI，gemini→Google，grok→OpenAI 兼容接口+XAI_API_KEY）。
+    统一 temperature=0.5、max_tokens=8192。未知模型抛 ValueError。
+    """
     temperature = 0.5
     max_tokens = 8192
 
@@ -70,7 +121,11 @@ def get_selector_llm(model_name: str):
 
 def format_solution_context(solution_id: str, solution_data: dict,
                             solution_code: str, analysis: str) -> str:
-    """Format a single solution's context for the prompt"""
+    """Format a single solution's context for the prompt
+
+    中文：把单个候选解格式化为 prompt 片段（含分数、亲本、状态、完整代码与完整分析报告），
+    供 selector 判断其变异潜力。
+    """
     parent_id = solution_data.get("parent_id", "None")
     score = solution_data.get("score", float('inf'))
     status = solution_data.get("status", "unknown")
@@ -92,6 +147,9 @@ Analysis:
 # Selector Prompt
 # ============================================================================
 
+# 中文：selector 的系统级 prompt（提示词字面量，切勿改动）。
+# 核心要求：在“开发(精修高分解) vs 探索(尝试有潜力的失败解/冷门分支)”之间取得平衡，
+# 并给出高/低潜力的判定信号，避免只选最高分或只选新奇解。
 SELECTOR_SYSTEM_PROMPT = """You are a solution selector for scientific machine learning research. Your task is to identify solutions with the most potential for further improvement through mutation.
 
 Your role is CRITICAL: You must balance exploitation (refining promising solutions) and exploration (trying underexplored branches). Consider both performance metrics AND structural insights from code and analysis.
@@ -139,6 +197,10 @@ def generate_selector_prompt(problem_description: str, requirements: str,
 
     Returns:
         Formatted prompt string
+
+    中文：拼装 selector 的用户级 prompt（含问题背景、需求、全部候选解上下文、
+    few-shot 高/低潜力示例、以及“选出恰好 MUTATION_BATCH-1 个解”的任务说明与输出格式）。
+    注意：其中的字符串字面量为提示词，切勿改动。
     """
 
     # Format solutions for prompt
@@ -227,6 +289,11 @@ def run_single_selector(model_key: str, model_name: str, problem: str, requireme
 
     Returns:
         Tuple of (model_key, SelectionOutput) or (model_key, Exception) if failed
+
+    中文：单个 selector 模型的一次完整选择（作为并行任务的包装）。
+    组合 system+user prompt 后以结构化输出调用 LLM。
+    容错设计：捕获异常并作为 (model_key, Exception) 返回，使某个模型失败不影响其它模型。
+    调用 LLM：由 model_name 决定（集成中的一员）。
     """
     try:
         llm = get_selector_llm(model_name)
@@ -253,8 +320,13 @@ def aggregate_selections(selections_by_model: Dict[str, SelectionOutput],
 
     Returns:
         List of selected solutions with aggregated reasoning
+
+    中文：集成投票聚合的核心。把各模型选出的解累计票数，并收集每个解来自各模型的理由；
+    再按“票数降序、分数升序(低分更优，作破平)”排序，取前 MUTATION_BATCH-1 个作为最终选择，
+    每个附上跨模型聚合后的理由。返回最终选择列表。
     """
     # Count votes for each solution
+    # 中文：遍历每个模型的输出，为其选中的每个解 +1 票，并把该模型给出的理由归档到该解名下。
     vote_counter = Counter()
     reasoning_by_solution = {}
 
@@ -273,18 +345,21 @@ def aggregate_selections(selections_by_model: Dict[str, SelectionOutput],
 
     # Get top (mutation_batch-1) solutions by vote count
     # Tiebreaker: lower score is better
+    # 中文：排序键 (-票数, 分数)：票数多者靠前；票数相同则分数低(更优)者靠前。
     ranked_solutions = sorted(
         vote_counter.items(),
         key=lambda x: (-x[1], scores_dict.get(x[0], float('inf')))  # Sort by votes (desc), then score (asc)
     )
 
     # Select top (mutation_batch-1)
+    # 中文：取排名前 MUTATION_BATCH-1 个作为本轮要变异的亲本（少 1 是给“当前最优解”留位）。
     selected = ranked_solutions[:MUTATION_BATCH-1]
 
     # Build final selection list with aggregated reasoning
     final_selections = []
     for sol_id, vote_count in selected:
         # Aggregate reasoning from all models
+        # 中文：把投给该解的所有模型理由合并成一段（标注来源模型），作为聚合理由。
         all_reasoning = reasoning_by_solution[sol_id]
         aggregated_reasoning = "\n".join([
             f"- [{r['model']}] {r['reasoning']}" for r in all_reasoning
@@ -322,6 +397,11 @@ def select_solutions_for_mutation(problem: str, requirements: str,
         - selected: List of selected solutions with aggregated reasoning
         - voting_results: Detailed voting breakdown
         - log_file: Path to selection log
+
+    中文：本模块主入口。加载 Top-K 各解的完整代码与分析报告 → 用 ThreadPoolExecutor
+    并行运行集成中每个 selector 模型 → 汇总各模型输出 → 投票聚合出最终选择 → 落选择日志。
+    容错：单模型失败会被跳过；若全部失败则抛 RuntimeError。
+    副作用：读取解目录/分析文件；并行调用多个 LLM；写 SELECTION_LOGS/iteration_XXX.md。
     """
     from constants import SOLUTION_AND_OUTPUTS_DIR, AB_DIR
 
@@ -352,6 +432,7 @@ def select_solutions_for_mutation(problem: str, requirements: str,
         top_k_solutions.append((sol_id, sol_data, solution_code, analysis_md))
 
     # Run each selector model IN PARALLEL using ThreadPoolExecutor
+    # 中文：集成的每个模型互不依赖，用线程池并行提交，谁先完成先收集，缩短总耗时。
     print(f"Running {len(ENSEMBLE_MODELS)} selector models in parallel...")
     selections_by_model = {}
 
@@ -371,6 +452,7 @@ def select_solutions_for_mutation(problem: str, requirements: str,
             model_key = futures[future]
             result = future.result()
 
+            # 中文：run_single_selector 把失败封装为 (model_key, Exception)，此处据此过滤。
             if isinstance(result[1], Exception):
                 print(f"✗ {model_key} failed: {result[1]}")
             else:
@@ -383,6 +465,7 @@ def select_solutions_for_mutation(problem: str, requirements: str,
         raise RuntimeError("All selector models failed!")
 
     # Aggregate votes
+    # 中文：构造 {解ID: 分数} 供投票破平使用，然后做多数投票聚合得到最终选择。
     scores_dict = {sol_id: sol_data["score"] for sol_id, sol_data in top_k_results.items()}
     final_selections = aggregate_selections(selections_by_model, scores_dict)
 
@@ -431,6 +514,10 @@ def save_selection_log(iteration: int,
 
     Returns:
         Path to log file
+
+    中文：把本轮选择过程写成 markdown 日志（候选清单 → 各模型选择 → 投票统计 → 最终选择与
+    聚合理由），落到 {SELECTION_LOGS_DIR}/iteration_XXX.md，供审计与后续检索记忆使用。
+    副作用：新建目录并覆盖写日志文件。返回日志路径。
     """
     os.makedirs(SELECTION_LOGS_DIR, exist_ok=True)
     log_file = os.path.join(SELECTION_LOGS_DIR, f"iteration_{iteration:03d}.md")
@@ -510,7 +597,10 @@ def save_selection_log(iteration: int,
 # ============================================================================
 
 def main():
-    """Test the selector with mock data"""
+    """Test the selector with mock data
+
+    中文：占位入口，真正的测试见 test_select_mutations.py。
+    """
     # This would be used for unit testing
     print("Use test_select_mutations.py for testing")
 

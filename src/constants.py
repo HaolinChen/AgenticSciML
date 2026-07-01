@@ -1,25 +1,63 @@
 """
 Configuration constants for the SciML Agent system.
+
+============================================================================
+中文模块说明（学习注释）
+============================================================================
+作用：
+    全系统的集中配置模块。定义 LLM 模型选择与路由、各智能体使用的模型与采样
+    温度、目录与文件路径、进化/选择/调试的各类上限与并发参数、以及各类执行超时。
+    几乎所有配置都可通过 SCIML_* 环境变量覆盖，未设置则使用此处的默认值。
+
+在 pipeline 中的位置：
+    被 main.py 及各阶段模块（create_contract/create_root/propose_critic/
+    select_mutations/analyze/retrieve_* 等）导入，作为“唯一事实来源”的配置。
+
+主要输入：
+    环境变量（均为可选，前缀 SCIML_）。例如 SCIML_USE_MINI、SCIML_MODEL_*、
+    SCIML_AGENT_MODEL_*、SCIML_TEMP_*、SCIML_*_DIR、SCIML_MAX_EVOLUTIONARY_ITERATIONS、
+    SCIML_MUTATION_BATCH、SCIML_SELECTION_POOL_SIZE、SCIML_ENSEMBLE_MODELS 等。
+
+主要输出（供其它模块导入的模块级常量）：
+    - 模型/智能体：MODELS、AGENT_MODELS、TEMPERATURES、ENSEMBLE_MODELS、USE_MINI
+    - 目录：USER_INPUT_DIR、TESTING_DIR、KB_DIR、AB_DIR、PROPOSAL_POOL_DIR、
+      SOLUTION_AND_OUTPUTS_DIR、RESULTS_DIR、DATA_ANALYSIS_DIR、SELECTION_LOGS_DIR
+    - 文件：RESULTS_FILE、KB_INDEX_FILE、DATASET_CONFIG_PATH
+    - 上限/并发：MAX_DEBUG_ITERATIONS、MAX_REFINEMENT_ITERATIONS、
+      MAX_PROPOSE_CRITIC_ROUNDS、MAX_CHILDREN_PER_NODE、MAX_EVOLUTIONARY_ITERATIONS、
+      MUTATION_BATCH、SELECTION_POOL_SIZE
+    - 超时：TIMEOUT_VALIDATION、TIMEOUT_TRAINING、TIMEOUT_EVALUATION、TIMEOUT_DATA_ANALYSIS
+
+关键函数列表：
+    - _env_str/_env_int/_env_float/_env_bool/_env_list  从环境变量读取并按类型解析（带默认值）
+    - get_speaker_name(agent_role)  根据智能体所用模型推断服务商，生成对话发言人标识
+============================================================================
 """
 
 import os
 
 
+# 下面五个 _env_* 辅助函数：统一从环境变量读取配置并按目标类型解析；
+# 环境变量未设置时返回传入的 default。这样每个常量都可被 SCIML_* 环境变量覆盖。
 def _env_str(name: str, default: str) -> str:
+    """中文：读环境变量为字符串，未设置则用 default。"""
     return os.getenv(name, default)
 
 
 def _env_int(name: str, default: int) -> int:
+    """中文：读环境变量并转 int，未设置则用 default。"""
     value = os.getenv(name)
     return int(value) if value is not None else default
 
 
 def _env_float(name: str, default: float) -> float:
+    """中文：读环境变量并转 float，未设置则用 default。"""
     value = os.getenv(name)
     return float(value) if value is not None else default
 
 
 def _env_bool(name: str, default: bool) -> bool:
+    """中文：读环境变量并转 bool；识别 1/true/yes/on（大小写不敏感）为真，未设置用 default。"""
     value = os.getenv(name)
     if value is None:
         return default
@@ -27,6 +65,7 @@ def _env_bool(name: str, default: bool) -> bool:
 
 
 def _env_list(name: str, default: list[str]) -> list[str]:
+    """中文：读环境变量并按逗号切分为去空白的字符串列表，未设置用 default。"""
     value = os.getenv(name)
     if value is None:
         return default
@@ -86,6 +125,9 @@ def get_speaker_name(agent_role: str) -> str:
 
     Returns:
         Speaker name formatted as "{role}_{provider}" (e.g., "proposer_gemini", "critic_gpt")
+
+    中文：根据智能体角色查出其绑定模型，再从模型名中推断服务商（gpt/gemini/claude/grok），
+        拼成对话历史里的“发言人”标识 "{角色}_{服务商}"。识别不到服务商时用 "unknown"。
     """
     model = AGENT_MODELS.get(agent_role, "")
 

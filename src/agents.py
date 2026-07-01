@@ -3,6 +3,64 @@ Shared agent functions for SciML Agent system.
 
 This module contains reusable agent functions that can be called from
 multiple scripts (create_contract.py, create_root.py, etc.)
+
+============================================================================
+中文模块说明（学习注释）
+============================================================================
+作用：
+    本文件是整个多智能体系统的“核心公共模块”，集中定义了所有基于 LLM 的智能体
+    函数（tester / engineer / validator / retriever / analyst / debugger /
+    proposer / critic 等），以及它们所依赖的模型路由、结构化输出 schema、
+    统一调用/遥测封装，还有把“解代码/评测代码”真正跑起来的子进程执行函数。
+    它被几乎所有阶段模块（create_contract / create_root / propose_critic /
+    analyze 等）导入复用。
+
+在 pipeline 中的位置（见 main.py 的 4 个阶段）：
+    - Phase0.5 数据分析：data_analyst 智能体（模型配置在 constants，但其 agent
+      函数不在本文件；本文件的 proposer/critic 会接收其产出的 data_analysis_report）
+    - Phase1 合约生成：tester_agent 生成 evaluate.py + guidelines.md，
+      validator_agent 在校验失败时判定责任方
+    - Phase2 根解生成/校验/训练：engineer_agent 生成 solution.py，
+      execute_solution/execute_evaluation 负责跑验证/训练/评测，
+      debugger_agent 给出修复建议，analyst_agent 产出分析报告
+    - Phase3 进化循环：retriever_agent 检索知识库，proposer_agent 与
+      critic_agent 多轮辩论产出改进提案，engineer_agent 工程化子代，
+      再次执行 + analyst_agent 分析
+
+主要输入：
+    - 函数参数：问题/需求/评测描述、各类代码文本、日志、分析报告、对话历史等
+    - 环境变量：
+        * SCIML_TELEMETRY_DIR       设置后开启遥测（记录 token/成本/时延）
+        * SCIML_TELEMETRY_ITERATION 当前进化迭代号（写入遥测记录）
+        * SCIML_TELEMETRY_SOLUTION_ID 当前解 ID（写入遥测记录）
+        * XAI_API_KEY               grok(xAI) 走 OpenAI 兼容接口所需 API key
+        * （各服务商的 API key 由各自 SDK/环境读取，见 .env）
+    - 依赖配置：constants.AGENT_MODELS / TEMPERATURES / MAX_PROPOSE_CRITIC_ROUNDS
+
+主要输出：
+    - pydantic 结构化对象（见下方 schema 列表）
+    - 文件副作用：execute_* 会写 train_log.txt / test_log.txt，遥测开启时写遥测记录
+    - 子进程结果：execute_* 以子进程方式运行 solution.py / evaluate.py
+
+关键类与函数清单：
+    pydantic schema：
+        ContractOutput / SolutionOutput / ValidationDecision / KBRetrievalResult
+        / AnalysisReport / DebugSuggestion / ProposalOutput / CritiqueOutput
+    LLM 基础设施：
+        get_llm（模型路由：claude/gpt/gemini/grok）、_llm_invoke（统一调用+重试+遥测）
+    智能体函数：
+        tester_agent / engineer_agent / validator_agent / retriever_agent /
+        analyst_agent / debugger_agent / proposer_agent / critic_agent
+        （proposer/critic 的分轮 prompt 构造：_proposer_*_prompt / _critic_*_prompt）
+    工具与执行：
+        get_available_gpus / parse_evaluation_json /
+        execute_solution / execute_evaluation
+
+重要约束（勿破坏）：
+    本文件中的大段三引号常量（*_STENCIL、*_SYSTEM_PROMPT）以及 f-string 拼出的
+    prompt 文本，都是发送给 LLM 的合同/提示词，属于“行为敏感字符串”，改动会改变
+    模型输出，务必不要修改其内容。
+============================================================================
 """
 
 from dotenv import load_dotenv
@@ -20,20 +78,29 @@ load_dotenv()
 # ============================================================================
 # Pydantic Models
 # ============================================================================
+# 中文：以下均为各智能体的“结构化输出 schema”。调用 LLM 时通过
+#   llm.with_structured_output(schema) 强制模型按该结构返回，
+#   _llm_invoke 最终返回对应的 pydantic 对象，便于下游安全取字段。
 
 class ContractOutput(BaseModel):
-    """Structured output for Tester agent"""
+    """Structured output for Tester agent
+    中文：tester_agent 的产出。Phase1 合约生成使用，同时给出两份文件文本：
+        evaluate.py（评测脚本）与 guidelines.md（工程合约）。"""
     evaluate_py: str = Field(description="Complete Python code for evaluate.py")
     guidelines_md: str = Field(description="Complete markdown content for guidelines.md")
 
 
 class SolutionOutput(BaseModel):
-    """Structured output for Engineer agent"""
+    """Structured output for Engineer agent
+    中文：engineer_agent 的产出，即完整的 solution.py 源码文本（Phase2/Phase3）。"""
     solution_code: str = Field(description="Complete Python code for solution.py")
 
 
 class ValidationDecision(BaseModel):
-    """Structured output for Validator agent"""
+    """Structured output for Validator agent
+    中文：validator_agent 的产出。校验(validate)失败时判定责任归属，
+        culprit 取值：tester_error（合约/评测脚本问题）、engineer_error（解代码问题）、
+        success（其实无错）；specific_feedback 给出可执行的修复建议。"""
     culprit: Literal["tester_error", "engineer_error", "success"] = Field(
         description="Who is responsible for the validation error"
     )
@@ -43,7 +110,9 @@ class ValidationDecision(BaseModel):
 
 
 class KBRetrievalResult(BaseModel):
-    """Structured output for KB retriever agent"""
+    """Structured output for KB retriever agent
+    中文：retriever_agent 的产出。从知识库条目中最多选 1 条（或不选）：
+        selected_entry_index 为所选条目的 0-based 下标或 None；reasoning 为选取理由。"""
     selected_entry_index: int | None = Field(
         description="Index of the selected KB entry from indices.json (0-based), or None if no entry is relevant"
     )
@@ -53,7 +122,10 @@ class KBRetrievalResult(BaseModel):
 
 
 class AnalysisReport(BaseModel):
-    """Structured output for Analyst agent"""
+    """Structured output for Analyst agent
+    中文：analyst_agent 的产出。analysis_markdown 为完整分析报告（含 Summary、
+        训练动态、性能拆解、发现的问题、与父代对比等小节）；plot_analysis 为可选的
+        图像分析小节（当传入了 plot 图片时才会有）。"""
     analysis_markdown: str = Field(
         description="Complete markdown analysis report with sections: Summary, Training Dynamics, Performance Breakdown, Problems Identified, Comparison with Parent (if applicable)"
     )
@@ -64,17 +136,20 @@ class AnalysisReport(BaseModel):
 
 
 class DebugSuggestion(BaseModel):
-    """Structured output for Debugger agent"""
+    """Structured output for Debugger agent
+    中文：debugger_agent 的产出，一条简洁可执行的调试修复建议（仅实现层面）。"""
     suggestion: str = Field(description="Concise, actionable debugging suggestion")
 
 
 class ProposalOutput(BaseModel):
-    """Structured output for Proposer agent"""
+    """Structured output for Proposer agent
+    中文：proposer_agent 的产出，markdown 格式的改进提案（Phase3 进化提案）。"""
     proposal_markdown: str = Field(description="Complete proposal in markdown format")
 
 
 class CritiqueOutput(BaseModel):
-    """Structured output for Critic agent"""
+    """Structured output for Critic agent
+    中文：critic_agent 的产出，markdown 格式的批判意见与改进建议（Phase3 辩论）。"""
     critique_markdown: str = Field(description="Complete critique with suggestions")
 
 
@@ -83,33 +158,50 @@ class CritiqueOutput(BaseModel):
 # ============================================================================
 
 def get_llm(agent_name: str):
-    """Get LLM instance for a specific agent."""
+    """Get LLM instance for a specific agent.
+
+    中文：模型路由工厂。根据智能体角色名从 constants.AGENT_MODELS 查出模型名、
+        从 TEMPERATURES 查出采样温度，再依据模型名中的关键字选择对应服务商的
+        LangChain 客户端并实例化返回。
+    关键参数：agent_name —— 角色名（如 "tester"/"engineer"/"proposer" 等）。
+    返回：一个可 .invoke 的 LangChain Chat 模型实例。
+    副作用：无（仅构造客户端对象，不实际发起请求）。
+    异常：模型名不匹配任何已知服务商时抛 ValueError。
+    """
     import os as _os
     model_name = AGENT_MODELS[agent_name]
     temperature = TEMPERATURES[agent_name]
 
     # This needs to be changed based on what model you are using
+    # 中文：统一的最大输出 token 上限（不同服务商参数名不同，见下方各分支）。
     max_tokens_setting = 60000
 
+    # 中文：按模型名关键字路由到四类服务商之一——
     if "claude" in model_name:
+        # 中文：Anthropic Claude —— 走 langchain_anthropic 的 ChatAnthropic。
         return ChatAnthropic(
             model=model_name,
             temperature=temperature,
             max_tokens=max_tokens_setting,
         )
     elif "gpt" in model_name or "o1" in model_name:
+        # 中文：OpenAI GPT / o1 系列 —— 走 langchain_openai 的 ChatOpenAI。
         return ChatOpenAI(
             model=model_name,
             temperature=temperature,
             max_tokens=max_tokens_setting,
         )
     elif "gemini" in model_name:
+        # 中文：Google Gemini —— 走 ChatGoogleGenerativeAI，
+        #       注意其输出上限参数名为 max_output_tokens（与其他家不同）。
         return ChatGoogleGenerativeAI(
             model=model_name,
             temperature=temperature,
             max_output_tokens=max_tokens_setting,
         )
     elif "grok" in model_name:
+        # 中文：xAI grok —— 复用 OpenAI 兼容协议（ChatOpenAI），但需显式指定
+        #       base_url 指向 x.ai 的 /v1 端点，并从环境变量 XAI_API_KEY 取 key。
         return ChatOpenAI(
             model=model_name,
             temperature=temperature,
@@ -118,6 +210,7 @@ def get_llm(agent_name: str):
             api_key=_os.environ.get("XAI_API_KEY"),
         )
     else:
+        # 中文：未知模型名 —— 直接报错，避免静默使用错误后端。
         raise ValueError(f"Unsupported model: {model_name}")
 
 
@@ -127,13 +220,25 @@ def _llm_invoke(llm, schema, messages, agent_name: str):
     extract token usage and cost using include_raw=True and write a record.
 
     Returns the parsed Pydantic object (same as llm.with_structured_output(schema).invoke(messages)).
+
+    中文：所有智能体调用 LLM 的“统一入口”，封装了两件事：
+        1) 结构化输出 + 失败重试：最多重试 3 次；若模型返回 None（结构化解析失败），
+           每次间隔 10s 再试；3 次仍为 None 则返回 None，交由调用方处理。
+        2) 可选遥测：当环境变量 SCIML_TELEMETRY_DIR 存在时，用 include_raw=True
+           拿到原始响应，从中抽取 token 用量、计算成本与吞吐，并落盘一条记录。
+    关键参数：llm（get_llm 得到的实例）、schema（pydantic 输出结构）、
+        messages（System/Human 消息列表）、agent_name（角色名，用于遥测与日志）。
+    返回：解析后的 pydantic 对象（未开启遥测时同 with_structured_output().invoke()）。
+    副作用：可能 print 重试日志；开启遥测时写遥测文件。
     """
     import os as _os
     import time as _time
+    # 中文：遥测开关——设置了目录才记录，否则走轻量分支。
     _tel_dir = _os.environ.get("SCIML_TELEMETRY_DIR")
 
     if not _tel_dir:
         # No telemetry — call normally, with retry on None
+        # 中文：无遥测分支——普通调用，仅对返回 None 做重试。
         for _attempt in range(3):
             _result = llm.with_structured_output(schema).invoke(messages)
             if _result is not None:
@@ -144,6 +249,8 @@ def _llm_invoke(llm, schema, messages, agent_name: str):
         return _result  # return None after 3 failures, let caller handle
 
     # Telemetry enabled: use include_raw to capture usage metadata, with retry on None
+    # 中文：遥测分支——include_raw=True 会同时返回 parsed(解析对象) 与 raw(原始消息)，
+    #       后者带 token 用量元数据；同样最多重试 3 次直到拿到非 None 的 parsed。
     for _attempt in range(3):
         t0 = _time.time()
         raw_result = llm.with_structured_output(schema, include_raw=True).invoke(messages)
@@ -158,6 +265,9 @@ def _llm_invoke(llm, schema, messages, agent_name: str):
     raw_msg = raw_result.get("raw")
 
     # Extract tokens from raw AIMessage
+    # 中文：从原始消息里抽取输入/输出 token 数。不同服务商元数据位置不同：
+    #       优先读 usage_metadata（LangChain 归一化字段）；
+    #       读不到再回退到 response_metadata（OpenAI 等），并兼容多种键名。
     input_tokens = 0
     output_tokens = 0
     token_source = "unknown"
@@ -180,6 +290,7 @@ def _llm_invoke(llm, schema, messages, agent_name: str):
     model_name = AGENT_MODELS.get(agent_name, "")
     from telemetry import compute_cost, LLMCallRecord, write_llm_record
     from datetime import datetime as _dt
+    # 中文：按模型定价换算成本，并用总 token / 时延估算吞吐（tokens/s）。
     in_cost, out_cost, total_cost = compute_cost(model_name, input_tokens, output_tokens)
     total_tokens = input_tokens + output_tokens
     throughput = total_tokens / latency if latency > 0 else 0.0
@@ -200,6 +311,7 @@ def _llm_invoke(llm, schema, messages, agent_name: str):
         throughput_tps=round(throughput, 1),
         token_source=token_source,
     )
+    # 中文：把本次调用的遥测记录追加写入遥测目录（迭代号/解 ID 从环境变量读取）。
     write_llm_record(record, _tel_dir)
 
     return parsed
@@ -208,7 +320,13 @@ def _llm_invoke(llm, schema, messages, agent_name: str):
 # ============================================================================
 # Prompt Templates and Stencils
 # ============================================================================
+# 中文：以下所有大写常量都是发给 LLM 的“模板/提示词”。*_STENCIL 是要求生成代码
+#   遵循的骨架样例，*_SYSTEM_PROMPT 是各智能体的系统角色设定。
+#   【重要】这些字符串内容属于行为敏感的合同/提示词，切勿修改其文本。
 
+# 中文：evaluate.py 的代码骨架。tester_agent 会把它嵌入 prompt，要求生成的评测脚本
+#   遵循此结构（get_test_data / load_model_from_checkpoint / compute_success_metric
+#   以及打印 "--- FINAL SCALAR METRIC ---" 的 JSON 结果约定）。
 EVALUATE_PY_STENCIL = '''
 # <any_necessary_imports>
 
@@ -317,6 +435,9 @@ if __name__ == "__main__":
         sys.exit(1)         # Exit with a non-zero code to signal failure
 '''
 
+# 中文：guidelines.md（工程合约）的骨架。规定 MODEL 类命名、输入/输出形状与
+#   dtype、checkpoint 保存到 ./MODEL_CHECKPOINT 的方式、validate/train 双模式入口等，
+#   engineer_agent 生成 solution.py 时必须严格遵守。
 GUIDELINES_MD_STENCIL = '''
 # Engineering Contract & Guidelines
 
@@ -397,6 +518,8 @@ During the testing phase, I'll test your model submission by running:
 (... NEVER include any suggestions for algorithms, model architectures, optimizers, etc. ...)
 '''
 
+# 中文：tester（合约生成/评测设计者）的系统提示词。约束其只做“测试契约”决策
+#   （接口/形状/checkpoint/评测指标），不得泄露测试数据、不得给出解题算法建议。
 TESTER_SYSTEM_PROMPT = """You are an expert software tester designing a testing contract for scientific machine learning problems.
 
 Your role: You must make ALL technical decisions about testing, model interfaces, and data formats. The Engineer will follow your contract exactly, so your decisions must be:
@@ -582,6 +705,8 @@ if __name__ == "__main__":
 - This JSON format MUST be included VERBATIM - it's infrastructure code
 """
 
+# 中文：engineer（工程师）的系统提示词。约束其严格遵守 guidelines 合约，
+#   产出可一次跑通的 solution.py（含 validate/train 双模式与 checkpoint 保存）。
 ENGINEER_SYSTEM_PROMPT = """You are an expert ML engineer implementing scientific machine learning solutions.
 
 Your job: Generate complete, working solution code that follows the engineering contract EXACTLY.
@@ -672,6 +797,8 @@ Use the reference code as a guide for WHAT to implement, not HOW to write it in 
 
 Your code will be executed as-is. Make it work on the first try."""
 
+# 中文：validator（校验裁决者）的系统提示词。用于在验证失败时判断到底是
+#   tester(合约/评测脚本) 还是 engineer(解代码) 的问题，并给出修复反馈。
 VALIDATOR_SYSTEM_PROMPT = """You are a debugging expert analyzing validation failures.
 
 Your job: Determine who is responsible for the validation error.
@@ -755,6 +882,8 @@ Evaluate.py has: `with torch.no_grad(): residual = compute_pde_residual(...)`
 Analyze carefully and return structured decision with specific feedback."""
 
 
+# 中文：debugger（调试助手）的系统提示词。只做“实现层面”的报错修复建议，
+#   不涉及算法/研究策略层面的改动。
 DEBUGGER_SYSTEM_PROMPT = """You are an experienced debugging assistant for scientific ML code. Your ONLY job is to help fix implementation errors.
 
 **CRITICAL CONSTRAINTS - What You Should NOT Suggest:**
@@ -782,6 +911,8 @@ DEBUGGER_SYSTEM_PROMPT = """You are an experienced debugging assistant for scien
 Your job is to analyze errors and provide SINGLE, CONCISE, ACTIONABLE debugging suggestions (2-4 sentences maximum)."""
 
 
+# 中文：retriever（知识库检索者）的系统提示词。要求从 KB 条目中挑选最多 1 条
+#   真正有助于改进当前冠军解、且可落地实现的技术条目。
 RETRIEVER_SYSTEM_PROMPT = """You are a critical knowledge base retriever for scientific ML research.
 
 **Your Role:**
@@ -795,6 +926,8 @@ RETRIEVER_SYSTEM_PROMPT = """You are a critical knowledge base retriever for sci
 You are CRITICAL and SELECTIVE, not eager to suggest. Most of the time, no KB entry is needed. Only select an entry if it will make a significant, feasible improvement."""
 
 
+# 中文：analyst（结果分析师）的系统提示词。要求基于训练/测试日志与分数写出
+#   客观的分析报告，只暴露问题、不提出改进方案。
 ANALYST_SYSTEM_PROMPT = """You are an experienced, critical ML research analyst.
 
 **Your Role:**
@@ -819,6 +952,8 @@ ANALYST_SYSTEM_PROMPT = """You are an experienced, critical ML research analyst.
 - Remember: downstream agents cannot see the plots, so describe them as if explaining to someone who is blind"""
 
 
+# 中文：proposer（提案者）的系统提示词。Phase3 中与 critic 多轮辩论，
+#   综合父代分析/KB/AB/数据分析，最终产出可直接交付工程师实现的改进提案。
 PROPOSER_SYSTEM_PROMPT = """You are an experienced scientific ML research analyst and proposal generator.
 
 **Your role varies by round:**
@@ -843,6 +978,8 @@ PROPOSER_SYSTEM_PROMPT = """You are an experienced scientific ML research analys
 - Specify exact hyperparameter values, never vague suggestions"""
 
 
+# 中文：critic（批判者）的系统提示词。Phase3 中扮演“反方”，对 proposer 的推理
+#   与实现计划进行严格批判，推动提案更严谨、更可落地。
 CRITIC_SYSTEM_PROMPT = """You are a critical evaluator of scientific ML reasoning and plans. You help a proposer improve their proposals through rigorous critique.
 
 **Your role varies by round:**
@@ -883,9 +1020,18 @@ def tester_agent(problem: str, requirements: str, evaluation: str,
 
     Returns:
         ContractOutput with evaluate_py and guidelines_md
+
+    中文：
+        角色：tester（测试合约设计者）。所用模型：AGENT_MODELS["tester"]（默认 claude）。
+        阶段：Phase1 合约生成（也在合约细化时被复用）。
+        输入：problem/requirements/evaluation 三份用户描述，可选 dataset_info、
+              refinement_feedback（有反馈=细化模式，无=首次生成）。
+        产出：ContractOutput（evaluate.py + guidelines.md 两份文本）。
+        副作用：调用外部 LLM（经 _llm_invoke，可能触发遥测）。
     """
     llm = get_llm("tester")
 
+    # 中文：无反馈=首次生成完整契约；有反馈=按反馈细化已有契约（见下方 else 分支）。
     if not refinement_feedback:
         # Initial generation
         dataset_section = ""
@@ -999,6 +1145,18 @@ def engineer_agent(problem: str, requirements: str, guidelines: str,
 
     Returns:
         SolutionOutput with solution_code
+
+    中文：
+        角色：engineer（工程师）。所用模型：AGENT_MODELS[agent_name]
+              （Phase2 根解常用 "root_engineer"，Phase3 子代用 "engineer"，默认均为 claude）。
+        阶段：Phase2 根解生成 / Phase3 子代工程化 / 以及调试迭代（三种模式见下）。
+        输入：problem/requirements/guidelines 及可选训练集信息、父代代码、提案、
+              当前解代码、调试反馈。三种模式：
+                1) champion_code+proposal 且无反馈 → Phase3 按提案在父代之上实现子代；
+                2) 无反馈 → Phase2 从零生成根解；
+                3) 有 refinement_feedback → 按调试反馈修复当前解代码。
+        产出：SolutionOutput（完整 solution.py 文本）。
+        副作用：调用外部 LLM。
     """
     llm = get_llm(agent_name)
 
@@ -1122,8 +1280,16 @@ def validator_agent(guidelines: str, solution_code: str, evaluate_code: str,
 
     Returns:
         ValidationDecision with culprit and specific feedback
+
+    中文：
+        角色：validator（校验裁决者）。所用模型：复用 tester 的模型（见下行）。
+        阶段：Phase1/Phase2 中 validate（冒烟测试）失败时调用。
+        输入：guidelines、solution.py、evaluate.py 三份代码 + 报错 traceback。
+        产出：ValidationDecision（culprit 责任归属 + specific_feedback 修复建议）。
+        副作用：调用外部 LLM。
     """
     llm = get_llm("tester")  # Use same model as tester for analysis
+    # 中文：注意——validator 没有独立模型条目，这里刻意复用 tester 的模型来做失败分析。
 
     prompt = f"""Analyze this validation failure and determine root cause.
 
@@ -1172,10 +1338,18 @@ def retriever_agent(champion_code: str, champion_analysis: str,
 
     Returns:
         KBRetrievalResult with selected entry index and reasoning
+
+    中文：
+        角色：retriever（知识库检索者）。所用模型：AGENT_MODELS["retriever"]（默认 gemini）。
+        阶段：Phase3 进化循环——在生成提案前，从 KB(indices.json) 里挑最多 1 条可用条目。
+        输入：冠军解代码、冠军解分析、问题描述、KB 条目元数据列表。
+        产出：KBRetrievalResult（所选条目下标或 None + 理由）。
+        副作用：调用外部 LLM。
     """
     llm = get_llm("retriever")
 
     # Format KB entries for the prompt
+    # 中文：把每条 KB 条目格式化为 "[下标] 方法名 + 描述"，供模型带下标选择。
     kb_list = []
     for idx, entry in enumerate(kb_indices):
         kb_list.append(f"""
@@ -1244,8 +1418,17 @@ def analyst_agent(solution_code: str, train_log: str, test_log: str,
 
     Returns:
         Markdown-formatted analysis report
+
+    中文：
+        角色：analyst（结果分析师）。所用模型：AGENT_MODELS["analyst"]（默认 gemini）。
+        阶段：Phase2 根解分析 / Phase3 子代分析。
+        输入：solution.py、train_log、test_log、最终分数，可选 proposal、父代分析、
+              plot_images（图片 base64；有图则走 Gemini 多模态分支）。
+        产出：str —— 拼接好的 markdown 分析报告（含可选的 Plot Analysis 小节）。
+        副作用：调用外部 LLM（可能是多模态）；返回前把 plot_analysis 追加进正文。
     """
     # Prepare proposal section
+    # 中文：以下几段都是根据是否有 proposal / 父代分析 / 图片，动态拼装报告里对应小节。
     if proposal:
         proposal_section = "**Proposal** (what was attempted):\n" + proposal + "\n"
     else:
@@ -1343,6 +1526,8 @@ CRITICAL:
 - Focus on understanding what happened and what problems exist both qualitatively and quantitatively, not what should be done next."""
 
     # Check if multimodal (with images) or text-only
+    # 中文：有图片则走多模态（直接构造 Gemini 客户端并把图片以 image_url 形式塞进消息），
+    #       无图片则走普通文本分支（get_llm("analyst")）。
     num_images = 0
     if plot_images and len(plot_images) > 0:
         # Use multimodal approach with images
@@ -1383,6 +1568,7 @@ CRITICAL:
     result = _llm_invoke(llm, AnalysisReport, messages, "analyst")
 
     # Combine analysis_markdown and plot_analysis if present
+    # 中文：若模型另外产出了图像分析，则把它作为 "## Plot Analysis" 小节追加到报告末尾。
     final_analysis = result.analysis_markdown
     if result.plot_analysis:
         # Insert plot analysis section into the markdown
@@ -1415,6 +1601,13 @@ def debugger_agent(
 
     Returns:
         DebugSuggestion with concise, actionable fix
+
+    中文：
+        角色：debugger（调试助手）。所用模型：AGENT_MODELS["debugger"]（默认 gpt）。
+        阶段：Phase2/Phase3 的 engineer-execute-debug 循环——解代码报错时给修复建议。
+        输入：报错信息与 traceback、出错的 solution 代码、问题/需求/合约上下文。
+        产出：DebugSuggestion（一条简洁可执行的实现层修复建议）。
+        副作用：调用外部 LLM。只处理实现 bug，不给算法/策略建议。
     """
     llm = get_llm("debugger")
 
@@ -1470,6 +1663,9 @@ def get_available_gpus() -> list[int]:
 
     Returns:
         List of GPU IDs (e.g., [0, 1]) or [] for CPU-only
+
+    中文：调用 nvidia-smi 探测可用 GPU 列表；命令超时(5s)/不存在/异常时静默返回 []（视为纯 CPU）。
+        副作用：起一个短命子进程执行 nvidia-smi。
     """
     try:
         import subprocess
@@ -1502,6 +1698,9 @@ def parse_evaluation_json(stdout: str) -> dict:
 
     Raises:
         ValueError: If JSON not found or invalid
+
+    中文：从 evaluate.py 的 stdout 里用正则抽取形如 {"status":..., "score":...} 的
+        JSON 并解析为 dict。找不到则抛 ValueError。无副作用（纯解析）。
     """
     import json
     import re
@@ -1533,6 +1732,16 @@ def execute_solution(solution_dir: str, mode: Literal["validate", "train"], pare
 
     Returns:
         (success: bool, log_file_path: str)
+
+    中文：
+        作用：在 solution_dir 目录下以子进程运行 `python solution.py --mode <mode>`，
+              并把输出实时流式写入 train_log.txt。
+        输入：solution_dir（解目录）、mode（"validate" 冒烟 / "train" 完整训练）、
+              parent_id（仅上下文，未实际使用）。
+        输出：(success 布尔, 日志文件路径)。
+        超时：validate 用 TIMEOUT_VALIDATION(600s)，train 用 TIMEOUT_TRAINING(7200s)；
+              超时则 kill 子进程并在日志追加 TIMEOUT 标记、返回 False。
+        副作用：起子进程、写 train_log.txt；开启遥测时追加 ExecutionRecord。
     """
     import os
     import sys
@@ -1544,14 +1753,17 @@ def execute_solution(solution_dir: str, mode: Literal["validate", "train"], pare
     log_file = os.path.join(solution_dir, "train_log.txt")
 
     # Determine timeout based on mode
+    # 中文：按模式选择超时上限——冒烟测试短、完整训练长。
     timeout = TIMEOUT_VALIDATION if mode == "validate" else TIMEOUT_TRAINING
 
     try:
         # Set PYTHONUNBUFFERED to force line-buffered output
+        # 中文：强制子进程行缓冲，保证日志能实时刷到文件（便于 tail -f 观察）。
         env = os.environ.copy()
         env['PYTHONUNBUFFERED'] = '1'
 
         # Use Popen for streaming to file
+        # 中文：用 Popen 而非 run，以便边跑边读；stderr 合并进 stdout 统一收集。
         process = subprocess.Popen(
             [sys.executable, "solution.py", "--mode", mode],
             cwd=solution_dir,
@@ -1563,10 +1775,12 @@ def execute_solution(solution_dir: str, mode: Literal["validate", "train"], pare
         )
 
         # Stream output to log file in real-time
+        # 中文：主循环——逐行读子进程输出并即时落盘；同时轮询超时与进程结束。
         start_time = time.time()
         with open(log_file, 'w') as f:
             while True:
                 # Check timeout
+                # 中文：超时则杀掉子进程、写 TIMEOUT 标记并以失败返回。
                 if time.time() - start_time > timeout:
                     process.kill()
                     f.write(f"\n\n!!! TIMEOUT after {timeout} seconds !!!\n")
@@ -1580,6 +1794,7 @@ def execute_solution(solution_dir: str, mode: Literal["validate", "train"], pare
                     f.flush()  # Ensure immediate write to disk
 
                 # Check if process finished
+                # 中文：进程已结束则读完剩余输出后跳出循环。
                 if process.poll() is not None:
                     # Read any remaining output
                     remaining = process.stdout.read()
@@ -1589,6 +1804,7 @@ def execute_solution(solution_dir: str, mode: Literal["validate", "train"], pare
                     break
 
                 # Small sleep if no output to avoid busy waiting
+                # 中文：无新输出时短睡 0.1s，避免空转占满 CPU。
                 if not line:
                     time.sleep(0.1)
 
@@ -1600,6 +1816,7 @@ def execute_solution(solution_dir: str, mode: Literal["validate", "train"], pare
             f.write(f"\n\n=== Return code: {returncode} ===\n")
 
         # Record execution telemetry
+        # 中文：开启遥测时，记录本次执行的时长/退出码/GPU 等（成功=退出码 0）。
         _tel_dir = os.environ.get("SCIML_TELEMETRY_DIR")
         if _tel_dir:
             from telemetry import ExecutionRecord, write_execution_record
@@ -1639,6 +1856,16 @@ def execute_evaluation(solution_dir: str) -> tuple[bool, float, str]:
 
     Returns:
         (success: bool, score: float, log_file_path: str)
+
+    中文：
+        作用：在 solution_dir 下以子进程运行 `python evaluate.py`，实时流式写入
+              test_log.txt，跑完后从输出中解析最终分数。
+        输入：solution_dir（解目录）。
+        输出：(success 布尔, score 分数(越低越好，失败为 inf), 日志文件路径)。
+        超时：TIMEOUT_EVALUATION(600s)；超时 kill 并返回 (False, inf, log)。
+        分数解析（多重兜底）：优先取 "--- FINAL SCALAR METRIC ---" 标记后的 JSON；
+              失败则用正则在全文找 JSON；再不行且退出码 0 时用 "Final score:" 等正则兜底。
+        副作用：起子进程、写 test_log.txt；开启遥测时追加 ExecutionRecord。
     """
     import os
     import sys
@@ -1724,6 +1951,8 @@ def execute_evaluation(solution_dir: str) -> tuple[bool, float, str]:
 
         # Parse JSON output with robust fallback methods
         # Try primary parsing method (marker-based)
+        # 中文：首选解析——按约定标记 "--- FINAL SCALAR METRIC ---" 取其后首行 JSON。
+        #       status=success 返回分数；status=error 视为失败返回 inf。
         if "--- FINAL SCALAR METRIC ---" in output:
             try:
                 json_str = output.split("--- FINAL SCALAR METRIC ---")[1].strip().split('\n')[0]
@@ -1739,6 +1968,7 @@ def execute_evaluation(solution_dir: str) -> tuple[bool, float, str]:
                 # Fall through to backup parsing
 
         # Backup parsing: Look for JSON anywhere in output using regex
+        # 中文：兜底一——正则在整段输出里找同时含 status/score 的 JSON，取最后一个。
         import re
         json_pattern = r'\{[^}]*"status"[^}]*"score"[^}]*\}'
         matches = re.findall(json_pattern, output, re.DOTALL)
@@ -1752,6 +1982,7 @@ def execute_evaluation(solution_dir: str) -> tuple[bool, float, str]:
                 pass
 
         # Final fallback: If return code is 0 and no JSON, try to extract score from output
+        # 中文：兜底二——退出码为 0 但没有 JSON 时，用文本正则(如 "Final score: ...")提取数值。
         if returncode == 0:
             # Look for patterns like "Final score: 0.0123" or "Final MSE: 0.0123"
             score_patterns = [
@@ -1767,6 +1998,7 @@ def execute_evaluation(solution_dir: str) -> tuple[bool, float, str]:
                     return True, score, log_file
 
         # Complete failure - no score found
+        # 中文：全部兜底均失败——打印诊断信息并以 (False, inf, log) 返回。
         print(f"ERROR: Could not extract score from evaluation output")
         print(f"Expected: JSON with '--- FINAL SCALAR METRIC ---' marker")
         print(f"Got: {len(output)} chars, return code: {returncode}")
@@ -1820,10 +2052,21 @@ def proposer_agent(
 
     Returns:
         ProposalOutput with proposal markdown
+
+    中文：
+        角色：proposer（提案者）。所用模型：AGENT_MODELS["proposer"]（默认 gemini）。
+        阶段：Phase3 进化循环——与 critic 进行 MAX_PROPOSE_CRITIC_ROUNDS 轮辩论。
+        输入：父代代码/分析、测试合约、问题/需求、KB 条目、AB(亲属)报告、选择理由、
+              当前轮次 round_num、对话历史，及可选训练集信息/数据分析报告。
+        产出：ProposalOutput（markdown 提案）。
+        副作用：调用外部 LLM。
+        分轮逻辑（见下）：前若干轮=推理(reasoning)，倒数第二轮=综合(synthesis)，
+              最后一轮=定稿(finalization，无后续批判)。
     """
     llm = get_llm("proposer")
 
     # Route to appropriate prompt based on round number
+    # 中文：按轮次路由到不同的 prompt 构造器（推理/综合/定稿三种模式）。
     if round_num < MAX_PROPOSE_CRITIC_ROUNDS - 1:
         # Reasoning mode (rounds 1 to N-2)
         prompt = _proposer_reasoning_prompt(
@@ -1858,7 +2101,9 @@ def _proposer_reasoning_prompt(champion_code, champion_analysis, testing_contrac
                                       problem, requirements, kb_entry, ab_reports,
                                       selector_reasoning, round_num, conversation_history,
                                       training_set_info="", data_analysis_report="") -> str:
-    """Generate reasoning prompt for proposer (rounds 1 to N-2)"""
+    """Generate reasoning prompt for proposer (rounds 1 to N-2)
+    中文：构造 proposer “推理模式”的 human prompt（前 N-2 轮）：只做深度数学/理论分析，
+        不给具体实现。按需拼接对话历史/训练集/数据分析等上下文小节后返回字符串。"""
 
     # Format conversation history if exists
     history_text = ""
@@ -2010,7 +2255,9 @@ def _proposer_synthesis_prompt(champion_code, champion_analysis, testing_contrac
                                        problem, requirements, kb_entry, ab_reports,
                                        selector_reasoning, conversation_history,
                                        training_set_info="", data_analysis_report="") -> str:
-    """Generate synthesis prompt for round N-1"""
+    """Generate synthesis prompt for round N-1
+    中文：构造 proposer “综合模式”的 prompt（第 N-1 轮）：把前面的推理收敛为一个
+        具体的实现计划。返回拼好的字符串。"""
 
     history_text = "\n\n".join([
         f"**{msg.name}**:\n{msg.content}" for msg in conversation_history
@@ -2129,7 +2376,9 @@ def _proposer_finalization_prompt(champion_code, champion_analysis, testing_cont
                                          problem, requirements, kb_entry, ab_reports,
                                          selector_reasoning, conversation_history,
                                          training_set_info="", data_analysis_report="") -> str:
-    """Generate finalization prompt for last round"""
+    """Generate finalization prompt for last round
+    中文：构造 proposer “定稿模式”的 prompt（最后一轮）：产出可直接交付工程师、
+        含精确超参的最终提案，此后不再有批判。返回拼好的字符串。"""
 
     history_text = "\n\n".join([
         f"**{msg.name}**:\n{msg.content}" for msg in conversation_history
@@ -2247,7 +2496,9 @@ This is your final word. Make it count."""
 def _critic_reasoning_prompt(proposal, champion_code, champion_analysis, problem,
                                     requirements, testing_contract, selector_reasoning,
                                     round_num, conversation_history, data_analysis_report="") -> str:
-    """Generate reasoning critique prompt (rounds 1 to N-2)"""
+    """Generate reasoning critique prompt (rounds 1 to N-2)
+    中文：构造 critic “推理批判”的 prompt（前 N-2 轮）：针对 proposer 的理论推理
+        进行质疑。返回拼好的字符串。"""
 
     # Format conversation history
     history_text = ""
@@ -2372,7 +2623,9 @@ Ideas for concrete implementation directions emerging from the reasoning (very c
 def _critic_plan_prompt(proposal, champion_code, champion_analysis, problem,
                                requirements, testing_contract, selector_reasoning,
                                conversation_history, data_analysis_report="") -> str:
-    """Generate plan critique prompt (round N-1)"""
+    """Generate plan critique prompt (round N-1)
+    中文：构造 critic “计划批判”的 prompt（第 N-1 轮）：针对 proposer 综合出的
+        实现计划做严格评审（具体度/超参/合规性等）。返回拼好的字符串。"""
 
     history_text = "\n\n".join([
         f"**{msg.name}**:\n{msg.content}" for msg in conversation_history
@@ -2507,10 +2760,19 @@ def critic_agent(
 
     Returns:
         CritiqueOutput with critique markdown
+
+    中文：
+        角色：critic（批判者）。所用模型：AGENT_MODELS["critic"]（默认 gpt）。
+        阶段：Phase3 进化循环——与 proposer 对辩，逐轮挑刺推动提案改进。
+        输入：当前提案、父代代码/分析、问题/需求、测试合约、选择理由、轮次、对话历史、
+              可选数据分析报告。
+        产出：CritiqueOutput（markdown 批判 + 建议）。
+        副作用：调用外部 LLM。注意最后一轮由 proposer 定稿，故 critic 无“定稿”分支。
     """
     llm = get_llm("critic")
 
     # Route to appropriate prompt based on round number
+    # 中文：按轮次路由——前 N-2 轮批判“推理”，第 N-1 轮批判“实现计划”。
     if round_num < MAX_PROPOSE_CRITIC_ROUNDS - 1:
         # Reasoning critique (rounds 1 to N-2)
         prompt = _critic_reasoning_prompt(

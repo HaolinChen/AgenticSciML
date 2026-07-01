@@ -4,6 +4,41 @@ Data Analyst Agent module for exploratory data analysis.
 This standalone module performs EDA on training datasets using a Gemini agent
 with image understanding capabilities. It generates analysis code, executes it,
 analyzes visualizations, and produces text-only reports for downstream agents.
+
+================================ 中文模块说明 ================================
+【作用】
+    数据分析师(data_analyst)智能体模块，负责对用户训练集执行探索性数据分析(EDA)。
+    它先让 LLM“生成 EDA 代码”，再以子进程“执行代码”产出图表与统计文本，
+    然后用具备图像理解能力的 Gemini 模型“看图”写出纯文本分析报告，供下游只能读文本的
+    智能体使用。
+
+【所属阶段/角色】
+    Phase 0.5（数据分析阶段）的核心；角色为 data_analyst。被 run_data_analysis.py 调用。
+
+【主要输入】
+    - 文件：
+        * DATASET_CONFIG_PATH 指定的 dataset_config.json（内含 training_set：filename/
+          description/loading_instructions，指向 .npz 训练集）。
+        * USER_INPUT_DIR 下的问题描述文件：problem.md / requirements.md / evaluation.md。
+        * 训练集 .npz（由生成的分析代码在 USER_INPUT_DIR 工作目录中加载）。
+    - 参数：max_debug_iterations（生成-执行-调试循环的最大轮数）。
+    - 环境变量：无直接读取（LLM 密钥/遥测目录由 constants/agents 层处理）。
+    - 配置常量：AGENT_MODELS、TEMPERATURES、DATA_ANALYSIS_DIR、USER_INPUT_DIR、
+      DATASET_CONFIG_PATH、TIMEOUT_DATA_ANALYSIS。
+
+【主要输出】（均写入 DATA_ANALYSIS_DIR，即 DATA_ANALYSIS/）
+    - analysis_code.py：最近一次生成并执行的 EDA 代码。
+    - plots/：EDA 生成的图片(png/jpg)。
+    - analysis_log.md：每轮生成/执行/报错的讨论日志。
+    - data_analysis_report.md：最终纯文本分析报告（下游智能体读取）。
+    - 返回值：run_analysis_workflow 返回 0 成功 / 非 0 失败。
+
+【关键函数清单】
+    - generate_analysis_code(...)   : 调 LLM 生成/修复 EDA 代码（结构化输出）。
+    - execute_analysis_code(...)    : 落盘并以子进程执行 EDA 代码，捕获输出/错误。
+    - analyze_plots_with_vision(...): 用 Gemini 图像理解，把图表转写为纯文本报告。
+    - run_analysis_workflow(...)    : 主工作流，含“生成-执行-调试”循环并产出报告。
+============================================================================
 """
 
 import os
@@ -32,7 +67,12 @@ from agents import get_llm
 # ============================================================================
 
 class AnalysisCodeOutput(BaseModel):
-    """Structured output for data analyst code generation"""
+    """Structured output for data analyst code generation
+
+    中文：data_analyst 生成 EDA 代码时的结构化输出 schema。
+    - analysis_code：完整可执行的 EDA Python 代码。
+    - analysis_plan：本次分析的目的与内容简述（用于日志记录）。
+    """
     analysis_code: str = Field(
         description="Complete Python code for exploratory data analysis"
     )
@@ -42,7 +82,11 @@ class AnalysisCodeOutput(BaseModel):
 
 
 class AnalysisReportOutput(BaseModel):
-    """Structured output for data analyst report generation"""
+    """Structured output for data analyst report generation
+
+    中文：data_analyst 生成分析报告时的结构化输出 schema。
+    - report_markdown：仅含文本的 Markdown 报告，描述图表中观察到的发现。
+    """
     report_markdown: str = Field(
         description="Text-only analysis report describing findings from visualizations"
     )
@@ -51,6 +95,9 @@ class AnalysisReportOutput(BaseModel):
 # ============================================================================
 # System Prompts
 # ============================================================================
+# 中文：以下两个 system prompt 为英文提示词字面量，严禁改动其内容。
+#   - ANALYST_CODE_GENERATION_PROMPT：指导 LLM 生成“可执行的 EDA 代码”。
+#   - ANALYST_REPORT_GENERATION_PROMPT：指导具备视觉能力的 LLM“看图写纯文本报告”。
 
 ANALYST_CODE_GENERATION_PROMPT = """You are an expert data analyst specializing in scientific machine learning datasets.
 
@@ -157,18 +204,29 @@ def generate_analysis_code(
 
     Returns:
         AnalysisCodeOutput with analysis code and plan
+
+    中文说明：
+        做什么：调用 data_analyst 角色的 LLM 生成 EDA 代码；若传入 error_feedback
+                则进入“调试模式”，让 LLM 依据上次报错修复代码。
+        参数：
+            dataset_config      —— dataset_config.json 解析出的字典。
+            problem_description —— 拼接后的问题描述文本。
+            error_feedback      —— 上一次执行的报错（空串表示首次生成）。
+            plots_dir_absolute  —— 图表保存目录的绝对路径（写入 prompt 供代码使用）。
+        返回：AnalysisCodeOutput（analysis_code + analysis_plan）。
+        副作用：发起一次 LLM 调用（结构化输出）；不写文件。
     """
     llm = get_llm("data_analyst")
 
-    # Extract training set info
+    # 从 dataset_config 中取出训练集元信息（文件名/描述/加载说明），拼入 prompt
     training_set = dataset_config.get("training_set", {})
     filename = training_set.get("filename", "")
     description = training_set.get("description", "")
     loading_instructions = training_set.get("loading_instructions", "")
 
-    # Construct prompt
+    # 构造用户消息：区分“调试模式”（带上次报错）与“首次生成”两种分支
     if error_feedback:
-        # Debugging mode
+        # 调试模式：把上一轮报错反馈给 LLM，要求针对性修复
         prompt = f"""The previous analysis code failed with the following error:
 
 ```
@@ -204,7 +262,7 @@ plt.savefig(os.path.join(plots_dir, 'distribution.png'))
 Generate corrected Python code for exploratory data analysis.
 """
     else:
-        # First generation
+        # 首次生成：仅提供问题与数据集信息，让 LLM 从零生成 EDA 代码
         prompt = f"""**Problem:**
 {problem_description}
 
@@ -234,6 +292,7 @@ Focus on mathematical properties, data quality, and insights relevant to solving
         HumanMessage(content=prompt)
     ]
 
+    # 以结构化输出方式调用 LLM，强制返回 AnalysisCodeOutput 结构
     result = llm.with_structured_output(AnalysisCodeOutput).invoke(messages)
 
     return result
@@ -249,11 +308,20 @@ def execute_analysis_code(analysis_code: str, timeout: int = None) -> tuple[bool
 
     Returns:
         Tuple of (success: bool, output/error: str)
+
+    中文说明：
+        做什么：把 LLM 生成的 EDA 代码落盘为 analysis_code.py，并以独立 Python
+                子进程执行，捕获 stdout/stderr。
+        参数：analysis_code——待执行代码；timeout——超时秒数（默认 TIMEOUT_DATA_ANALYSIS）。
+        返回：(success, output)。成功时 output 为 stdout；失败时 output 为
+              汇总的报错文本（含 exit code、stdout、stderr），供下一轮调试使用。
+        副作用：写 DATA_ANALYSIS/analysis_code.py，创建 DATA_ANALYSIS/plots/ 目录，
+                起子进程；子进程工作目录设为 USER_INPUT_DIR 以便访问数据集。
     """
     if timeout is None:
         timeout = TIMEOUT_DATA_ANALYSIS
 
-    # Save code to file (use absolute path)
+    # 将代码写入固定文件（绝对路径），并预建 plots 输出目录
     code_path = os.path.abspath(os.path.join(DATA_ANALYSIS_DIR, "analysis_code.py"))
     os.makedirs(DATA_ANALYSIS_DIR, exist_ok=True)
     os.makedirs(os.path.join(DATA_ANALYSIS_DIR, "plots"), exist_ok=True)
@@ -261,11 +329,11 @@ def execute_analysis_code(analysis_code: str, timeout: int = None) -> tuple[bool
     with open(code_path, 'w') as f:
         f.write(analysis_code)
 
-    # Execute code
+    # 以子进程执行代码（隔离运行，避免污染主进程；带超时保护）
     try:
         result = subprocess.run(
             [sys.executable, code_path],
-            cwd=USER_INPUT_DIR,  # Execute in USER_INPUT to access datasets
+            cwd=USER_INPUT_DIR,  # 在 USER_INPUT 目录执行，便于按相对路径访问数据集
             capture_output=True,
             text=True,
             timeout=timeout
@@ -274,12 +342,15 @@ def execute_analysis_code(analysis_code: str, timeout: int = None) -> tuple[bool
         if result.returncode == 0:
             return True, result.stdout
         else:
+            # 非零退出：汇总退出码与标准输出/错误，作为调试反馈返回
             error_msg = f"Exit code {result.returncode}\n\nSTDOUT:\n{result.stdout}\n\nSTDERR:\n{result.stderr}"
             return False, error_msg
 
     except subprocess.TimeoutExpired:
+        # 超时：视为失败并返回超时说明
         return False, f"Execution timeout after {timeout} seconds"
     except Exception as e:
+        # 其它异常：统一转为失败并返回异常信息
         return False, f"Execution error: {str(e)}"
 
 
@@ -300,8 +371,17 @@ def analyze_plots_with_vision(
 
     Returns:
         AnalysisReportOutput with markdown report
+
+    中文说明：
+        做什么：加载 DATA_ANALYSIS/plots/ 下的所有图片，连同代码与执行文本一起
+                发给具备视觉能力的 Gemini 模型，产出“纯文本”分析报告。
+        参数：analysis_code、execution_output（执行文本输出）、dataset_config、
+              problem_description。
+        返回：AnalysisReportOutput（report_markdown）。
+        副作用：直接构造并调用 ChatGoogleGenerativeAI（Gemini，带视觉），读取图片文件；
+                无本地文件写入（报告的落盘在 run_analysis_workflow 中完成）。
     """
-    # Get Gemini model with vision capability
+    # 直接构造带视觉能力的 Gemini 模型（此处不走 get_llm，需自定义 max_output_tokens）
     model_name = AGENT_MODELS["data_analyst"]
     temperature = TEMPERATURES["data_analyst"]
 
@@ -311,7 +391,7 @@ def analyze_plots_with_vision(
         max_output_tokens=16000
     )
 
-    # Load all plots from DATA_ANALYSIS/plots/
+    # 收集 DATA_ANALYSIS/plots/ 下的所有图片文件，排序以保证顺序稳定
     plots_dir = os.path.join(DATA_ANALYSIS_DIR, "plots")
     plot_files = []
     if os.path.exists(plots_dir):
@@ -326,10 +406,10 @@ def analyze_plots_with_vision(
         # No plots generated, create text-only report
         print("Warning: No plots found, generating report from text output only")
 
-    # Prepare message content with images
+    # 组装多模态消息：先放文本提示，再逐一追加 base64 编码的图片
     message_parts: list[MessageLikeRepresentation] = []
 
-    # Add text prompt
+    # 追加文本部分（问题、数据集信息、执行输出、代码等上下文）
     training_set = dataset_config.get("training_set", {})
     prompt_text = f"""**Problem:**
 {problem_description}
@@ -355,13 +435,13 @@ Remember: These agents CANNOT see the images. Describe what you observe in text.
 """
     message_parts.append(prompt_text)
 
-    # Add images
+    # 逐张图片读入并转 base64，按 LangChain 的 image_url 格式追加到消息中
     for plot_path in plot_files:
         try:
             with open(plot_path, 'rb') as f:
                 image_bytes = f.read()
                 image_b64 = base64.b64encode(image_bytes).decode('utf-8')
-                # Use LangChain's image format
+                # 采用 data URI（内联 base64）方式传图，避免依赖外部可访问 URL
                 message_parts.append({
                     "type": "image_url",
                     "image_url": {"url": f"data:image/png;base64,{image_b64}"}
@@ -374,6 +454,7 @@ Remember: These agents CANNOT see the images. Describe what you observe in text.
         HumanMessage(content=message_parts)
     ]
 
+    # 结构化调用，强制返回仅含文本的 AnalysisReportOutput
     result = llm.with_structured_output(AnalysisReportOutput).invoke(messages)
 
     return result
@@ -392,13 +473,21 @@ def run_analysis_workflow(max_debug_iterations: int = 3) -> int:
 
     Returns:
         0 on success, non-zero on failure
+
+    中文说明：
+        做什么：Phase 0.5 的入口工作流。串联“生成代码→执行→(失败则)调试”循环，
+                成功后再用视觉模型写报告并落盘。
+        参数：max_debug_iterations——生成-执行-调试循环最大轮数。
+        返回：0 成功；1 缺少配置/训练集；2 调试轮数用尽仍失败或结果无效。
+        副作用：读 dataset_config.json 与 USER_INPUT 下问题文件；写 analysis_log.md、
+                analysis_code.py、plots/、data_analysis_report.md；多次调用 LLM，起子进程。
     """
 
     print("\n" + "="*80)
     print("DATA ANALYSIS WORKFLOW")
     print("="*80)
 
-    # Load dataset config
+    # 1) 读取 dataset_config.json（缺失或无 training_set 直接失败返回）
     if not os.path.exists(DATASET_CONFIG_PATH):
         print("Error: dataset_config.json not found")
         return 1
@@ -410,7 +499,7 @@ def run_analysis_workflow(max_debug_iterations: int = 3) -> int:
         print("Error: No training_set in dataset_config.json")
         return 1
 
-    # Load problem description
+    # 2) 拼接问题描述：按顺序读取 USER_INPUT 下三个可选文件并合并
     problem_files = ["problem.md", "requirements.md", "evaluation.md"]
     problem_description = ""
     for fname in problem_files:
@@ -419,7 +508,7 @@ def run_analysis_workflow(max_debug_iterations: int = 3) -> int:
             with open(fpath, 'r') as f:
                 problem_description += f"\n\n## {fname}\n\n{f.read()}"
 
-    # Create discussion log
+    # 3) 初始化讨论日志 analysis_log.md（写入表头，后续每轮追加）
     os.makedirs(DATA_ANALYSIS_DIR, exist_ok=True)
     discussion_path = os.path.join(DATA_ANALYSIS_DIR, "analysis_log.md")
     with open(discussion_path, 'w') as f:
@@ -427,11 +516,11 @@ def run_analysis_workflow(max_debug_iterations: int = 3) -> int:
         f.write(f"**Dataset:** {dataset_config['training_set']['filename']}\n\n")
         f.write("---\n\n")
 
-    # Compute absolute path for plots directory
+    # 4) 计算 plots 目录绝对路径（写进 prompt，确保生成代码把图存到正确位置）
     plots_dir_absolute = os.path.abspath(os.path.join(DATA_ANALYSIS_DIR, "plots"))
     os.makedirs(plots_dir_absolute, exist_ok=True)
 
-    # Self-debug loop
+    # 5) 生成-执行-调试循环：error_feedback 在失败后携带上一轮报错反哺下一轮生成
     error_feedback = ""
     code_result = None
     output = None
@@ -439,7 +528,7 @@ def run_analysis_workflow(max_debug_iterations: int = 3) -> int:
     for iteration in range(1, max_debug_iterations + 1):
         print(f"\n[Iteration {iteration}/{max_debug_iterations}] Generating analysis code...")
 
-        # Generate code
+        # 生成（或修复）EDA 代码
         code_result = generate_analysis_code(
             dataset_config=dataset_config,
             problem_description=problem_description,
@@ -449,7 +538,7 @@ def run_analysis_workflow(max_debug_iterations: int = 3) -> int:
 
         # Log timing for code generation
 
-        # Log to discussion
+        # 把本轮计划/上次报错/生成代码追加到讨论日志
         with open(discussion_path, 'a') as f:
             f.write(f"## Iteration {iteration}\n\n")
             f.write(f"**Plan:** {code_result.analysis_plan}\n\n")
@@ -457,11 +546,11 @@ def run_analysis_workflow(max_debug_iterations: int = 3) -> int:
                 f.write(f"**Previous Error:**\n```\n{error_feedback}\n```\n\n")
             f.write(f"**Generated Code:**\n```python\n{code_result.analysis_code}\n```\n\n")
 
-        # Execute code
+        # 执行 EDA 代码，拿到成功标志与输出/报错文本
         print(f"[Iteration {iteration}] Executing analysis code...")
         success, output = execute_analysis_code(code_result.analysis_code)
 
-        # Log execution result
+        # 把执行结果（成功输出或失败报错）追加到讨论日志
         with open(discussion_path, 'a') as f:
             if success:
                 f.write(f"**Execution:** Success\n\n")
@@ -472,9 +561,11 @@ def run_analysis_workflow(max_debug_iterations: int = 3) -> int:
             f.write("---\n\n")
 
         if success:
+            # 成功即跳出循环，进入报告生成阶段
             print(f"[Iteration {iteration}] Execution successful!")
             break
         else:
+            # 失败：记录报错作为下一轮反馈；若已是最后一轮则放弃并返回 2
             print(f"[Iteration {iteration}] Execution failed: {output[:200]}...")
             error_feedback = output
 
@@ -482,12 +573,12 @@ def run_analysis_workflow(max_debug_iterations: int = 3) -> int:
                 print(f"\nFailed after {max_debug_iterations} attempts. Giving up.")
                 return 2
 
-    # Check if we have valid results (should always be true if we reach here)
+    # 兜底校验：正常情况下到此必有有效结果（防御性检查）
     if code_result is None or output is None:
         print("\nError: No valid results from analysis loop")
         return 2
 
-    # Generate report with image understanding
+    # 6) 用视觉模型看图生成纯文本报告
     print("\nAnalyzing visualizations with image understanding...")
     report_result = analyze_plots_with_vision(
         analysis_code=code_result.analysis_code,
@@ -496,7 +587,7 @@ def run_analysis_workflow(max_debug_iterations: int = 3) -> int:
         problem_description=problem_description
     )
 
-    # Save report
+    # 7) 落盘最终报告 data_analysis_report.md（供下游智能体读取）
     report_path = os.path.join(DATA_ANALYSIS_DIR, "data_analysis_report.md")
     with open(report_path, 'w') as f:
         f.write(report_result.report_markdown)
